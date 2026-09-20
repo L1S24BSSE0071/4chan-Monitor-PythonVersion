@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 4chan monitor runtime files
+log_4chan.txt
+log_4chan.txt.err
+failures_4chan.txt
+stats_4chan.txt
+dead_cycle_4chan.tmp
+threads_4chan.txt
+priority_4chan.txt
+new_4chan.txt
+pause_4chan.txt

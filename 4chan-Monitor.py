@@ -2,6 +2,8 @@
 
 import argparse
 import contextlib
+from dataclasses import dataclass, replace
+import locale
 import os
 import re
 import shutil
@@ -11,10 +13,9 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 VERSION = "V 1.0"
 
@@ -87,7 +88,7 @@ COLORS = {
     "gray": "\033[90m",
     "reset": "\033[0m",
 }
-IS_TTY = sys.stdout.isatty()
+IS_TTY = bool(sys.stdout and sys.stdout.isatty())
 SPINNER = "|/-\\"
 
 
@@ -114,8 +115,11 @@ USE_COLOR = _enable_ansi()
 def cprint(msg: str = "", color: str = "white") -> None:
     if USE_COLOR:
         msg = f"{COLORS.get(color, '')}{msg}{COLORS['reset']}"
-    sys.stdout.write(msg + "\n")
-    sys.stdout.flush()
+    stream = sys.stdout
+    if stream is None:
+        return
+    stream.write(msg + "\n")
+    stream.flush()
 
 
 def press_any_key_to_exit() -> None:
@@ -130,15 +134,34 @@ def press_any_key_to_exit() -> None:
 
 stop_event = threading.Event()
 current_proc: Optional[subprocess.Popen] = None
+stop_file: Optional[Path] = None
+progress_callback: Optional[Callable[[str, bool], None]] = None
+download_output_callback: Optional[Callable[[str, str], None]] = None
+
+
+def report_progress(message: str, active: bool) -> None:
+    if progress_callback is not None:
+        progress_callback(message, active)
+
+
+def report_download_output(line: str, stream: str) -> None:
+    if download_output_callback is not None:
+        download_output_callback(line, stream)
+
+
+def stop_requested() -> bool:
+    if stop_file is not None and stop_file.exists():
+        stop_event.set()
+    return stop_event.is_set()
 
 
 def interruptible_sleep(seconds: float) -> bool:
     end = time.monotonic() + seconds
     while time.monotonic() < end:
-        if stop_event.is_set():
+        if stop_requested():
             return True
         time.sleep(min(0.2, max(0.0, end - time.monotonic())))
-    return stop_event.is_set()
+    return stop_requested()
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
@@ -279,6 +302,7 @@ def check_gallery_dl() -> str:
             text=True,
             timeout=10,
             stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
         )
         ver = (r.stdout or r.stderr or "").strip()
         if r.returncode != 0 or not ver:
@@ -409,12 +433,16 @@ def absorb_new_box() -> int:
 
 
 def wait_if_paused() -> None:
+    if stop_requested():
+        return
     if not CFG.pause_file.exists():
         return
     cprint(f"[PAUSED] Delete {CFG.pause_file} to resume...", "yellow")
-    while CFG.pause_file.exists():
+    while CFG.pause_file.exists() and not stop_requested():
         if interruptible_sleep(0.5):
             return
+    if stop_requested():
+        return
     cprint("[RESUMED]", "green")
     print()
 
@@ -453,7 +481,7 @@ def _clear_spinner() -> None:
 
 def run_gallery_dl(url: str) -> RunResult:
     global current_proc
-    if stop_event.is_set():
+    if stop_requested():
         return RunResult(-1, interrupted=True)
     err_path = CFG.log_file.with_name(CFG.log_file.name + ".err")
     cmd = ["gallery-dl", "--sleep-request", CFG.sleep_request, url]
@@ -465,10 +493,57 @@ def run_gallery_dl(url: str) -> RunResult:
     start = time.monotonic()
     timed_out = False
     code = 1
+    last_reported_elapsed = -1
+    report_progress(f"Downloading media: {url}", True)
     try:
         with CFG.log_file.open("wb") as out_f, err_path.open("wb") as err_f:
-            proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f, stdin=subprocess.DEVNULL, **popen_kw)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                bufsize=0,
+                cwd=str(CFG.list_file.parent),
+                **popen_kw,
+            )
             current_proc = proc
+            reader_errors = []
+            reader_failed = threading.Event()
+            output_encoding = locale.getpreferredencoding(False)
+
+            def forward_output(pipe, output_file, stream_name: str) -> None:
+                try:
+                    while True:
+                        chunk = pipe.readline()
+                        if not chunk:
+                            break
+                        output_file.write(chunk)
+                        output_file.flush()
+                        if stream_name == "stdout":
+                            report_download_output(
+                                chunk.decode(output_encoding, "replace").rstrip("\r\n"),
+                                stream_name,
+                            )
+                except Exception as e:
+                    reader_errors.append(e)
+                    reader_failed.set()
+                finally:
+                    pipe.close()
+
+            readers = [
+                threading.Thread(
+                    target=forward_output,
+                    args=(proc.stdout, out_f, "stdout"),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=forward_output,
+                    args=(proc.stderr, err_f, "stderr"),
+                    daemon=True,
+                ),
+            ]
+            for reader in readers:
+                reader.start()
             spin = 0
             while True:
                 try:
@@ -476,12 +551,21 @@ def run_gallery_dl(url: str) -> RunResult:
                     break
                 except subprocess.TimeoutExpired:
                     pass
-                if stop_event.is_set():
+                if reader_failed.is_set():
+                    kill_tree(proc)
+                    break
+                if stop_requested():
                     _clear_spinner()
                     cprint("  [INTERRUPTED] Stopping gallery-dl", "yellow")
                     kill_tree(proc)
                     break
                 elapsed = int(time.monotonic() - start)
+                if elapsed != last_reported_elapsed:
+                    report_progress(
+                        f"Downloading media: {url} ({elapsed // 60:02d}:{elapsed % 60:02d})",
+                        True,
+                    )
+                    last_reported_elapsed = elapsed
                 if elapsed >= CFG.gallery_timeout:
                     _clear_spinner()
                     cprint(f"  [TIMEOUT] {CFG.gallery_timeout}s exceeded, killing process", "red")
@@ -495,18 +579,28 @@ def run_gallery_dl(url: str) -> RunResult:
                     spin += 1
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5)
+            for reader in readers:
+                reader.join(timeout=5)
+            if any(reader.is_alive() for reader in readers):
+                cprint("  [ERROR] Could not finish reading gallery-dl output", "red")
+                kill_tree(proc)
+                for reader in readers:
+                    reader.join(timeout=1)
+            if reader_errors:
+                raise OSError(f"Could not capture gallery-dl output: {reader_errors[0]}")
             _clear_spinner()
             code = proc.returncode if proc.returncode is not None else 1
     except FileNotFoundError:
         cprint("  [FATAL] gallery-dl not found", "red")
         return RunResult(1, err="[gallery-dl][error] gallery-dl executable not found\n")
     except OSError as e:
-        if stop_event.is_set():
+        if stop_requested():
             return RunResult(-1, interrupted=True)
         cprint(f"  [ERROR] {e}", "red")
         return RunResult(1, err=f"[os][error] {e}\n")
     finally:
         current_proc = None
+        report_progress("Processing download result...", False)
         out_bytes = b""
         err_bytes = b""
         with contextlib.suppress(OSError):
@@ -518,7 +612,7 @@ def run_gallery_dl(url: str) -> RunResult:
                     f.write(err_bytes)
         with contextlib.suppress(OSError):
             err_path.unlink()
-    if stop_event.is_set():
+    if stop_requested():
         return RunResult(-1, interrupted=True)
     return RunResult(code, out_bytes.decode("utf-8", "ignore"), err_bytes.decode("utf-8", "ignore"), timed_out=timed_out)
 
@@ -700,6 +794,24 @@ def process_thread(
     return True
 
 
+def _self_test_stop_file() -> bool:
+    global stop_file
+    was_stopped = stop_event.is_set()
+    previous_stop_file = stop_file
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stop_file = Path(temp_dir) / "stop.txt"
+            stop_event.clear()
+            stop_file.touch()
+            return stop_requested()
+    finally:
+        stop_file = previous_stop_file
+        if was_stopped:
+            stop_event.set()
+        else:
+            stop_event.clear()
+
+
 def run_self_test() -> int:
     dead_err = "[4chan][error] HttpError: '404 Not Found' for 'https://a.4cdn.org/g/thread/2.json'\n"
     file_gone = (
@@ -727,6 +839,10 @@ def run_self_test() -> int:
     )
     cases = [
         ("missing file -> []", read_urls(Path("nonexistent-file")) == []),
+        (
+            "stop file requests graceful shutdown",
+            _self_test_stop_file(),
+        ),
         (
             "parse: dedupe + BOM + quotes + tabs + case + fragments + comments",
             parse_urls(text)
@@ -787,7 +903,8 @@ def run_self_test() -> int:
     return 0
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None, working_directory: Optional[Path] = None) -> None:
+    global CFG, stop_file
     parser = argparse.ArgumentParser(description="Monitor and download 4chan threads using gallery-dl.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be downloaded without downloading")
     parser.add_argument("--loops", type=int, default=None, help="Number of cycles (0 = infinite)")
@@ -795,11 +912,26 @@ def main() -> None:
     parser.add_argument("--no-pause", action="store_true", help="Don't wait for a key press before exiting")
     parser.add_argument("--no-update-check", action="store_true", help="Skip the PyPI update check at startup")
     parser.add_argument("--no-archive", action="store_true", help="Skip archive fallback when a thread 404s")
+    parser.add_argument("--stop-file", type=Path, help="Stop gracefully when this file exists")
     parser.add_argument("--self-test", action="store_true", help="Run internal self-tests")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.self_test:
         sys.exit(run_self_test())
+    stop_event.clear()
+    stop_file = args.stop_file
+    if working_directory is not None:
+        directory = working_directory.resolve()
+        CFG = replace(
+            CFG,
+            list_file=directory / CFG.list_file.name,
+            log_file=directory / CFG.log_file.name,
+            new_box=directory / CFG.new_box.name,
+            priority_box=directory / CFG.priority_box.name,
+            pause_file=directory / CFG.pause_file.name,
+            stats_file=directory / CFG.stats_file.name,
+            fail_log=directory / CFG.fail_log.name,
+        )
 
     def clear_screen() -> None:
         if args.no_clear or not IS_TTY:
@@ -987,7 +1119,7 @@ def main() -> None:
     cprint(f"  Unsupported : {totals['TOTAL_UNSUPPORTED']}", "yellow")
     cprint("=" * 79, "cyan")
     print()
-    if sys.stdin.isatty() and not args.no_pause and not stop_event.is_set():
+    if sys.stdin is not None and sys.stdin.isatty() and not args.no_pause and not stop_event.is_set():
         press_any_key_to_exit()
 
 

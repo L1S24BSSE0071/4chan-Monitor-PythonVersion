@@ -664,20 +664,19 @@ def main() -> None:
 
     if args.loops is not None:
         max_loops = max(0, args.loops)
-    elif args.dry_run:
-        max_loops = 1
-    elif not sys.stdin.isatty():
-        max_loops = 0
     else:
         cprint("How many monitor cycles to run? (0 = infinite)", "white")
         try:
             max_loops = max(0, int(input("Loop Count: ").strip() or "0"))
-        except (ValueError, EOFError):
+        except ValueError:
             max_loops = 0
+        except EOFError:
+            max_loops = 1 if args.dry_run else 0
         except KeyboardInterrupt:
             print()
             cprint("[EXIT] Interrupted at prompt, exiting.", "yellow")
             sys.exit(0)
+        print()
         clear_screen()
 
     totals = load_stats()

@@ -193,7 +193,12 @@ def safe_write(path: Path, content: str) -> bool:
 
 def cleanup_stale_temp() -> None:
     err_file = CFG.log_file.with_name(CFG.log_file.name + ".err")
-    for p in (*Path(".").glob(".*_4chan.txt.*.tmp"), err_file):
+    dirs = {
+        p.parent
+        for p in (CFG.list_file, CFG.log_file, CFG.new_box, CFG.priority_box, CFG.pause_file, CFG.stats_file, CFG.fail_log)
+    }
+    temp_files = [p for d in dirs if d.exists() for p in d.glob(".*_4chan.txt.*.tmp")]
+    for p in (*temp_files, err_file):
         with contextlib.suppress(OSError):
             p.unlink()
 
@@ -220,9 +225,17 @@ def archive_urls_for(url: str) -> List[str]:
 
 def _extract_url(line: str) -> Optional[str]:
     tokens = NOT_PRINTABLE_RE.sub("", WS_RE.sub(" ", line)).split("#", 1)[0].replace('"', " ").replace("'", " ").split()
-    if tokens and URL_RE.match(tokens[0]):
-        return tokens[0]
-    return None
+    if not tokens:
+        return None
+    u = tokens[0]
+    m_url = URL_RE.match(u)
+    if not m_url:
+        return None
+    u = m_url.group(0).lower() + u[m_url.end():]
+    m_th = THREAD_RE.match(u)
+    if m_th:
+        u = u[:m_th.start(2)].lower() + u[m_th.start(2):]
+    return u
 
 
 def parse_urls(text: str) -> List[str]:
@@ -476,12 +489,12 @@ def run_gallery_dl(url: str) -> RunResult:
             code = proc.returncode if proc.returncode is not None else 1
     except FileNotFoundError:
         cprint("  [FATAL] gallery-dl not found", "red")
-        return RunResult(1)
+        return RunResult(1, err="[gallery-dl][error] gallery-dl executable not found\n")
     except OSError as e:
         if stop_event.is_set():
             return RunResult(-1, interrupted=True)
         cprint(f"  [ERROR] {e}", "red")
-        return RunResult(1)
+        return RunResult(1, err=f"[os][error] {e}\n")
     finally:
         current_proc = None
         out_bytes = b""
@@ -544,6 +557,7 @@ def try_archive_fallback(url: str, counters: Dict[str, int]) -> Optional[bool]:
     if not arch_urls:
         return False
     cprint("  [404] Thread dead on 4chan, trying archive fallback...", "yellow")
+    empty_ok_url: Optional[str] = None
     for arch_url in arch_urls:
         wait_if_paused()
         if stop_event.is_set():
@@ -555,12 +569,20 @@ def try_archive_fallback(url: str, counters: Dict[str, int]) -> Optional[bool]:
         if res.timed_out:
             continue
         kind = classify(res)
-        if kind == "ok" or (kind == "partial" and bool(res.out.strip())):
+        if kind in ("ok", "partial") and bool(res.out.strip()):
             cprint("  [ARCHIVE OK] Recovered from archive, removing from active list", "green")
             log_failure(f"404 ARCHIVED ({arch_url}): {url}")
             counters.setdefault("CYCLE_ARCHIVED", 0)
             counters["CYCLE_ARCHIVED"] += 1
             return True
+        if kind == "ok" and empty_ok_url is None:
+            empty_ok_url = arch_url
+    if empty_ok_url is not None:
+        cprint("  [ARCHIVE OK] Recovered from archive, removing from active list", "green")
+        log_failure(f"404 ARCHIVED ({empty_ok_url}): {url}")
+        counters.setdefault("CYCLE_ARCHIVED", 0)
+        counters["CYCLE_ARCHIVED"] += 1
+        return True
     cprint("  [ARCHIVE MISS] Not found in archive, removing from list", "yellow")
     return False
 
@@ -678,14 +700,14 @@ def run_self_test() -> int:
         "\ufeffhttps://boards.4chan.org/g/thread/123#p9\n"
         "https://boards.4channel.org/g/thread/123/some-slug\n"
         '\ufeff   " https://boards.4chan.org/a/thread/5 "   # anime\n'
-        "https://boards.4chan.org/v/thread/77\tinline-tab-note\n"
+        "HTTPS://BOARDS.4CHAN.ORG/V/THREAD/77\tinline-tab-note\n"
         "https://\n"
         "not a url\n\n"
     )
     cases = [
         ("missing file -> []", read_urls(Path("nonexistent-file")) == []),
         (
-            "parse: dedupe + BOM + quotes + tabs + fragments + comments",
+            "parse: dedupe + BOM + quotes + tabs + case + fragments + comments",
             parse_urls(text)
             == [
                 "https://boards.4chan.org/g/thread/123",
@@ -784,7 +806,7 @@ def main() -> None:
         except ValueError:
             max_loops = 0
         except EOFError:
-            max_loops = 1 if args.dry_run else 0
+            max_loops = 1
         except KeyboardInterrupt:
             print()
             cprint("[EXIT] Interrupted at prompt, exiting.", "yellow")

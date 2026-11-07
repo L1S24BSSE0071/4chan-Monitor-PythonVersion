@@ -51,10 +51,12 @@ THREAD_GONE_RE = re.compile(
     r"\[(?!(?:downloader\b|download\]))[^\]]+\]\[error\]\s+(?:HttpError:\s*'?(?:404|410)\b|NotFoundError:)",
     re.I,
 )
-BLOCKED_RE = re.compile(r"\]\[error\]\s+(?:HttpError:\s*'?(?:429|403)\b|ChallengeError:)", re.I)
+BLOCKED_RE = re.compile(r"\]\[(?:error|warning)\]\s+(?:HttpError:\s*'?(?:429|403)\b|ChallengeError:)", re.I)
 UNSUPPORTED_RE = re.compile(r"\]\[error\]\s+Unsupported URL", re.I)
 ERROR_LINE_RE = re.compile(r"\]\[error\]", re.I)
 FAILED_DL_RE = re.compile(r"\]\[error\]\s+Failed to download", re.I)
+DL_WARN_RE = re.compile(r"\[downloader[^\]]*\]\[warning\]", re.I)
+DL_404_WARN_RE = re.compile(r"\[downloader[^\]]*\]\[warning\]\s+(?:HttpError:\s*)?'?(?:404|410)\b", re.I)
 DL_404_ERR_RE = re.compile(r"\[downloader[^\]]*\]\[error\]\s+(?:HttpError:\s*)?'?(?:404|410)\b", re.I)
 FILE_GONE_RE = re.compile(
     r"(?:\]\[warning\]|\[downloader[^\]]*\]\[error\])\s+(?:HttpError:\s*)?'?(?:404|410)\b",
@@ -192,12 +194,10 @@ def parse_urls(text: str) -> List[str]:
     seen: Set[str] = set()
     out: List[str] = []
     for line in text.splitlines():
-        tokens = NOT_PRINTABLE_RE.sub("", line).split("#", 1)[0].split()
-        if not tokens:
+        tokens = NOT_PRINTABLE_RE.sub("", line).split("#", 1)[0].replace('"', " ").replace("'", " ").split()
+        if not tokens or not URL_RE.match(tokens[0]):
             continue
-        cleaned = tokens[0].strip("\"'")
-        if not URL_RE.match(cleaned):
-            continue
+        cleaned = tokens[0]
         key = dedupe_key(cleaned)
         if key not in seen:
             seen.add(key)
@@ -473,7 +473,8 @@ def classify(res: RunResult) -> str:
     failed = len(FAILED_DL_RE.findall(err))
     dl_404_errs = len(DL_404_ERR_RE.findall(err))
     other_errors = len(ERROR_LINE_RE.findall(err)) - failed - dl_404_errs
-    if (failed or dl_404_errs) and other_errors == 0 and len(FILE_GONE_RE.findall(err)) >= failed:
+    non_404_dl_warns = len(DL_WARN_RE.findall(err)) - len(DL_404_WARN_RE.findall(err))
+    if (failed or dl_404_errs) and other_errors == 0 and non_404_dl_warns == 0 and len(FILE_GONE_RE.findall(err)) >= failed:
         return "partial"
     return "error"
 
@@ -577,10 +578,17 @@ def run_self_test() -> int:
         "[downloader.http][error] HttpError: '404 Not Found' for 'https://i.4cdn.org/g/9.jpg'\n"
         "[download][error] Failed to download 9.jpg\n"
     )
+    mixed_dl_err = (
+        "[downloader.http][warning] '404 Not Found' for 'https://i.4cdn.org/g/9.jpg' (1/2)\n"
+        "[downloader.http][warning] '404 Not Found' for 'https://i.4cdn.org/g/9.jpg' (2/2)\n"
+        "[download][error] Failed to download 9.jpg\n"
+        "[downloader.http][warning] ReadTimeoutError: timed out (1/2)\n"
+        "[download][error] Failed to download 10.jpg\n"
+    )
     text = (
         "\ufeffhttps://boards.4chan.org/g/thread/123#p9\n"
         "https://boards.4channel.org/g/thread/123/some-slug\n"
-        '\ufeff   "https://boards.4chan.org/a/thread/5"   # anime\n'
+        '\ufeff   " https://boards.4chan.org/a/thread/5 "   # anime\n'
         "https://\n"
         "not a url\n\n"
     )
@@ -603,6 +611,7 @@ def run_self_test() -> int:
         ("unsupported", classify(RunResult(64, err="[gallery-dl][error] Unsupported URL 'https://x.y/z'")) == "unsupported"),
         ("deleted image in live thread is not a dead thread", classify(RunResult(4, err=file_gone)) == "partial"),
         ("downloader 404 error is partial, not dead thread", classify(RunResult(4, err=dl_err_gone)) == "partial"),
+        ("404 image + timeout image is retried as error", classify(RunResult(4, err=mixed_dl_err)) == "error"),
         ("network error is retried", classify(RunResult(4, err="[4chan][error] ConnectionError: boom")) == "error"),
     ]
     failed = [name for name, ok in cases if not ok]

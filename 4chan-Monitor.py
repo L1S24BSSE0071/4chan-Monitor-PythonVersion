@@ -481,8 +481,16 @@ def classify(res: RunResult) -> str:
 
 
 def last_error_line(err: str) -> str:
-    lines = [ln.strip() for ln in err.splitlines() if ERROR_LINE_RE.search(ln)]
-    return lines[-1][:200] if lines else ""
+    all_lines = [ln.strip() for ln in err.splitlines() if ln.strip()]
+    err_lines = [ln for ln in all_lines if ERROR_LINE_RE.search(ln)]
+    if err_lines:
+        last_err = err_lines[-1]
+        if FAILED_DL_RE.search(last_err):
+            warns = [ln for ln in all_lines if DL_WARN_RE.search(ln)]
+            if warns:
+                return f"{warns[-1]} -> {last_err}"[:200]
+        return last_err[:200]
+    return all_lines[-1][:200] if all_lines else ""
 
 
 def log_failure(msg: str) -> None:
@@ -626,6 +634,7 @@ def run_self_test() -> int:
         ("404 image + timeout image is retried as error", classify(RunResult(4, err=mixed_dl_err)) == "error"),
         ("network error is retried", classify(RunResult(4, err="[4chan][error] ConnectionError: boom")) == "error"),
         ("version tuple padding", _version_tuple("1.28") == _version_tuple("1.28.0") and _version_tuple("1.29") > _version_tuple("1.28.9")),
+        ("last_error_line includes downloader warning context", "ReadTimeoutError" in last_error_line(mixed_dl_err)),
     ]
     failed = [name for name, ok in cases if not ok]
     for name, ok in cases:
@@ -772,8 +781,7 @@ def main() -> None:
                 has_more = not_last_job or not is_last_cycle
                 if not process_thread(url, label, args.dry_run, counters, dead_accum, pause_s, has_more):
                     break
-            if dead_accum:
-                remove_dead(dead_accum)
+            removed_count = remove_dead(dead_accum) if dead_accum else 0
             for total_key, cycle_key in COUNTER_MAP.items():
                 totals[total_key] += counters[cycle_key]
             if not args.dry_run:
@@ -798,8 +806,11 @@ def main() -> None:
             )
             cprint("-" * 71, "cyan")
             print()
-            if max_loops > 0 and current_loop >= max_loops:
+            if is_last_cycle:
                 cprint("[SYSTEM] Max cycles reached. Exiting.", "cyan")
+                break
+            if max_loops > 0 and removed_count >= queue_size and not CFG.new_box.exists():
+                cprint("[WAIT] No threads remaining in queue. Exiting.", "yellow")
                 break
             cprint(f"[SYSTEM] Resting {cycle_sleep}s...", "white")
             if interruptible_sleep(cycle_sleep):

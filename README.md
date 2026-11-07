@@ -36,6 +36,16 @@ pip install gallery-dl
 
 ## Quick start
 
+On Windows, double-click `Start-GUI.vbs`. It launches the GUI through `pythonw.exe`, without a command window, and shows an error dialog if Python cannot be found. You can also start it from PowerShell or Command Prompt with:
+
+```powershell
+pyw -3 .\4chan-Monitor-GUI.pyw
+```
+
+Add thread URLs to the normal or priority queue in the window, choose how many cycles to run (`0` means indefinitely), then select **Start monitoring**. While monitoring, new normal URLs are queued for the next cycle. During each download, the status area shows the active thread and elapsed time alongside an animated progress bar; this also applies to archive fallback downloads. The GUI runs the monitor engine in-process, so it does not open a command terminal or launch a second copy of the monitor. If startup fails, the GUI shows an error and writes details to `4chan-Monitor-GUI.error.log`.
+
+To run the command-line version instead:
+
 1. Create `threads_4chan.txt` in the folder you'll run the script from, with one thread URL per line:
 
    ```text
@@ -63,6 +73,7 @@ Downloads are saved wherever gallery-dl is configured to put them. By default th
 | `--no-pause`        | Don't wait for a key press before exiting                                          |
 | `--no-update-check` | Skip the PyPI update check at startup                                              |
 | `--no-archive`      | Skip third-party archive fallback when a 4chan thread returns 404                  |
+| `--stop-file PATH`  | Stop gracefully when the specified file exists                                    |
 | `--self-test`       | Run the built-in sanity checks and exit                                            |
 | `--help`            | Show usage information                                                             |
 
@@ -89,6 +100,7 @@ All files live in the directory you run the script from.
 | `priority_4chan.txt` | High-priority threads, processed first each cycle. Dead threads are removed automatically |
 | `new_4chan.txt`      | Drop new URLs here. They are merged into the main list and the file is deleted           |
 | `pause_4chan.txt`    | Create this file to pause; delete it to resume                                           |
+| `stop_4chan.txt`     | Created by the GUI to request a graceful stop; removed when the GUI exits               |
 | `log_4chan.txt`      | Raw output of the most recent `gallery-dl` run (overwritten for each thread)             |
 | `failures_4chan.txt` | Append-only, timestamped record of removals, blocks and failures                         |
 | `stats_4chan.txt`    | Lifetime counters (`key=value` format, written atomically)                               |

@@ -45,14 +45,21 @@ CFG = Config()
 
 URL_RE = re.compile(r"^https?://[^\s/]+", re.IGNORECASE)
 NOT_PRINTABLE_RE = re.compile(r"[^\x20-\x7E]+")
-THREAD_RE = re.compile(r"^https?://boards\.4chan(?:nel)?\.org/([a-z0-9]+)/thread/(\d+)", re.IGNORECASE)
+THREAD_RE = re.compile(r"^https?://boards\.4chan(?:nel)?\.org/([a-z0-9]+)/thread/(\d+)(?:[/?#]|$)", re.IGNORECASE)
 
-THREAD_GONE_RE = re.compile(r"\]\[error\]\s+(?:HttpError:\s*'?(?:404|410)\b|NotFoundError:)", re.I)
+THREAD_GONE_RE = re.compile(
+    r"\[(?!(?:downloader\b|download\]))[^\]]+\]\[error\]\s+(?:HttpError:\s*'?(?:404|410)\b|NotFoundError:)",
+    re.I,
+)
 BLOCKED_RE = re.compile(r"\]\[error\]\s+(?:HttpError:\s*'?(?:429|403)\b|ChallengeError:)", re.I)
 UNSUPPORTED_RE = re.compile(r"\]\[error\]\s+Unsupported URL", re.I)
 ERROR_LINE_RE = re.compile(r"\]\[error\]", re.I)
 FAILED_DL_RE = re.compile(r"\]\[error\]\s+Failed to download", re.I)
-FILE_GONE_RE = re.compile(r"\]\[warning\]\s+(?:HttpError:\s*)?'?(?:404|410)\b", re.I)
+DL_404_ERR_RE = re.compile(r"\[downloader[^\]]*\]\[error\]\s+(?:HttpError:\s*)?'?(?:404|410)\b", re.I)
+FILE_GONE_RE = re.compile(
+    r"(?:\]\[warning\]|\[downloader[^\]]*\]\[error\])\s+(?:HttpError:\s*)?'?(?:404|410)\b",
+    re.I,
+)
 
 COLORS = {
     "cyan": "\033[96m",
@@ -186,9 +193,11 @@ def parse_urls(text: str) -> List[str]:
     out: List[str] = []
     for line in text.splitlines():
         tokens = NOT_PRINTABLE_RE.sub("", line).split("#", 1)[0].split()
-        if not tokens or not URL_RE.match(tokens[0]):
+        if not tokens:
             continue
-        cleaned = tokens[0]
+        cleaned = tokens[0].strip("\"'")
+        if not URL_RE.match(cleaned):
+            continue
         key = dedupe_key(cleaned)
         if key not in seen:
             seen.add(key)
@@ -462,8 +471,9 @@ def classify(res: RunResult) -> str:
     if res.code == 0:
         return "partial" if FILE_GONE_RE.search(err) else "ok"
     failed = len(FAILED_DL_RE.findall(err))
-    other_errors = len(ERROR_LINE_RE.findall(err)) - failed
-    if failed and other_errors == 0 and len(FILE_GONE_RE.findall(err)) >= failed:
+    dl_404_errs = len(DL_404_ERR_RE.findall(err))
+    other_errors = len(ERROR_LINE_RE.findall(err)) - failed - dl_404_errs
+    if (failed or dl_404_errs) and other_errors == 0 and len(FILE_GONE_RE.findall(err)) >= failed:
         return "partial"
     return "error"
 
@@ -563,17 +573,21 @@ def run_self_test() -> int:
         "[downloader.http][warning] '404 Not Found' for 'https://i.4cdn.org/g/9.jpg'\n"
         "[download][error] Failed to download 9.jpg\n"
     )
+    dl_err_gone = (
+        "[downloader.http][error] HttpError: '404 Not Found' for 'https://i.4cdn.org/g/9.jpg'\n"
+        "[download][error] Failed to download 9.jpg\n"
+    )
     text = (
         "\ufeffhttps://boards.4chan.org/g/thread/123#p9\n"
         "https://boards.4channel.org/g/thread/123/some-slug\n"
-        "\ufeff   https://boards.4chan.org/a/thread/5   # anime\n"
+        '\ufeff   "https://boards.4chan.org/a/thread/5"   # anime\n'
         "https://\n"
         "not a url\n\n"
     )
     cases = [
         ("missing file -> []", read_urls(Path("nonexistent-file")) == []),
         (
-            "parse: dedupe + BOM + fragments + comments",
+            "parse: dedupe + BOM + quotes + fragments + comments",
             parse_urls(text) == ["https://boards.4chan.org/g/thread/123", "https://boards.4chan.org/a/thread/5"],
         ),
         (
@@ -588,6 +602,7 @@ def run_self_test() -> int:
         ),
         ("unsupported", classify(RunResult(64, err="[gallery-dl][error] Unsupported URL 'https://x.y/z'")) == "unsupported"),
         ("deleted image in live thread is not a dead thread", classify(RunResult(4, err=file_gone)) == "partial"),
+        ("downloader 404 error is partial, not dead thread", classify(RunResult(4, err=dl_err_gone)) == "partial"),
         ("network error is retried", classify(RunResult(4, err="[4chan][error] ConnectionError: boom")) == "error"),
     ]
     failed = [name for name, ok in cases if not ok]
@@ -640,6 +655,10 @@ def main() -> None:
 
     if args.loops is not None:
         max_loops = max(0, args.loops)
+    elif args.dry_run:
+        max_loops = 1
+    elif not sys.stdin.isatty():
+        max_loops = 0
     else:
         cprint("How many monitor cycles to run? (0 = infinite)", "white")
         try:

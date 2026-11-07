@@ -84,6 +84,7 @@ class MonitorGUI:
         self.download_progress_running = False
         self.stop_requested = False
         self.closing = False
+        self.monitor_error: Optional[str] = None
         self.owns_pause = False
         self.owns_stop = False
 
@@ -98,10 +99,11 @@ class MonitorGUI:
         self.cycles = tk.StringVar(value="0")
 
         root.title("4chan Thread Monitor")
-        root.geometry("1000x720")
-        root.minsize(720, 520)
+        root.geometry("1080x800")
+        root.minsize(820, 620)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.report_callback_exception = self._report_callback_exception
+        self._configure_styles()
         self._build_ui()
         self._set_running(False)
         self.refresh_queues()
@@ -112,103 +114,309 @@ class MonitorGUI:
     def running(self) -> bool:
         return self.worker is not None and self.worker.is_alive()
 
+    def _configure_styles(self) -> None:
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        self.colors = {
+            "background": "#f2f5f9",
+            "surface": "#ffffff",
+            "text": "#172033",
+            "muted": "#667085",
+            "accent": "#2563eb",
+            "accent_active": "#1d4ed8",
+            "console": "#111827",
+            "console_text": "#e5e7eb",
+        }
+        self.root.configure(background=self.colors["background"])
+        style.configure("TFrame", background=self.colors["background"])
+        style.configure("Card.TFrame", background=self.colors["surface"])
+        style.configure(
+            "TLabel",
+            background=self.colors["background"],
+            foreground=self.colors["text"],
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "Card.TLabel",
+            background=self.colors["surface"],
+            foreground=self.colors["text"],
+        )
+        style.configure(
+            "Title.TLabel",
+            background=self.colors["background"],
+            foreground=self.colors["text"],
+            font=("Segoe UI", 20, "bold"),
+        )
+        style.configure(
+            "Subtitle.TLabel",
+            background=self.colors["background"],
+            foreground=self.colors["muted"],
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "Section.TLabel",
+            background=self.colors["surface"],
+            foreground=self.colors["text"],
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.configure(
+            "Muted.Card.TLabel",
+            background=self.colors["surface"],
+            foreground=self.colors["muted"],
+        )
+        style.configure(
+            "Primary.TButton",
+            background=self.colors["accent"],
+            foreground="#ffffff",
+            padding=(14, 8),
+            borderwidth=0,
+            font=("Segoe UI", 9, "bold"),
+        )
+        style.map(
+            "Primary.TButton",
+            background=[
+                ("disabled", "#a9bde8"),
+                ("active", self.colors["accent_active"]),
+            ],
+            foreground=[("disabled", "#f4f6fb"), ("!disabled", "#ffffff")],
+        )
+        style.configure("TButton", padding=(10, 7), font=("Segoe UI", 9))
+        style.configure(
+            "TEntry",
+            padding=7,
+            fieldbackground=self.colors["surface"],
+            foreground=self.colors["text"],
+        )
+        style.configure(
+            "TSpinbox",
+            padding=5,
+            fieldbackground=self.colors["surface"],
+            foreground=self.colors["text"],
+        )
+        style.configure(
+            "TCheckbutton",
+            background=self.colors["surface"],
+            foreground=self.colors["text"],
+        )
+        style.map(
+            "TCheckbutton",
+            background=[("active", self.colors["surface"])],
+        )
+        style.configure(
+            "Horizontal.TProgressbar",
+            background=self.colors["accent"],
+            troughcolor="#e7edf5",
+            bordercolor="#e7edf5",
+            lightcolor=self.colors["accent"],
+            darkcolor=self.colors["accent"],
+        )
+
     def _build_ui(self) -> None:
-        container = ttk.Frame(self.root, padding=12)
+        container = ttk.Frame(self.root, padding=(22, 18))
         container.pack(fill=tk.BOTH, expand=True)
         container.columnconfigure(1, weight=1)
-        container.rowconfigure(2, weight=1)
+        container.rowconfigure(3, weight=3)
         container.rowconfigure(6, weight=2)
 
-        ttk.Label(container, text="Working folder").grid(
-            row=0, column=0, sticky="w"
-        )
-        self.directory_entry = ttk.Entry(container, textvariable=self.data_dir)
-        self.directory_entry.grid(
-            row=0, column=1, sticky="ew", padx=(8, 8)
-        )
-        self.browse_button = ttk.Button(
-            container, text="Browse...", command=self._browse
-        )
-        self.browse_button.grid(row=0, column=2, sticky="ew")
+        header = ttk.Frame(container)
+        header.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+        ttk.Label(
+            header, text="4chan Thread Monitor", style="Title.TLabel"
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            header,
+            text="Manage thread queues and monitor downloads from one window.",
+            style="Subtitle.TLabel",
+        ).pack(anchor=tk.W, pady=(2, 0))
 
-        options = ttk.Frame(container)
+        folder_card = ttk.Frame(
+            container, style="Card.TFrame", padding=(14, 12)
+        )
+        folder_card.grid(
+            row=1, column=0, columnspan=3, sticky="ew", pady=(0, 10)
+        )
+        folder_card.columnconfigure(1, weight=1)
+        ttk.Label(
+            folder_card, text="Working folder", style="Section.TLabel"
+        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        self.directory_entry = ttk.Entry(
+            folder_card, textvariable=self.data_dir
+        )
+        self.directory_entry.grid(row=0, column=1, sticky="ew")
+        self.browse_button = ttk.Button(
+            folder_card, text="Browse…", command=self._browse
+        )
+        self.browse_button.grid(row=0, column=2, padx=(8, 0))
+
+        options = ttk.Frame(
+            container, style="Card.TFrame", padding=(14, 10)
+        )
         self.options_frame = options
-        options.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 6))
+        options.grid(
+            row=2, column=0, columnspan=3, sticky="ew", pady=(0, 10)
+        )
         ttk.Checkbutton(
-            options, text="Check gallery-dl updates at startup", variable=self.check_updates
+            options,
+            text="Check gallery-dl updates at startup",
+            variable=self.check_updates,
         ).pack(side=tk.LEFT)
         ttk.Checkbutton(
-            options, text="Try archive mirrors for dead threads", variable=self.use_archive
-        ).pack(side=tk.LEFT, padx=(16, 0))
-        ttk.Label(options, text="Cycles (0 = forever)").pack(
-            side=tk.LEFT, padx=(16, 4)
-        )
+            options,
+            text="Try archive mirrors for dead threads",
+            variable=self.use_archive,
+        ).pack(side=tk.LEFT, padx=(20, 0))
+        ttk.Label(
+            options,
+            text="Cycles (0 = forever)",
+            style="Muted.Card.TLabel",
+        ).pack(side=tk.LEFT, padx=(20, 8))
         self.cycles_entry = ttk.Spinbox(
             options, from_=0, to=100000, width=8, textvariable=self.cycles
         )
         self.cycles_entry.pack(side=tk.LEFT)
 
-        self.queue_frame = ttk.LabelFrame(container, text="Thread queues", padding=8)
+        self.queue_frame = ttk.Frame(
+            container, style="Card.TFrame", padding=(14, 12)
+        )
         self.queue_frame.grid(
-            row=2, column=0, columnspan=3, sticky="nsew", pady=(0, 8)
+            row=3, column=0, columnspan=3, sticky="nsew", pady=(0, 10)
         )
         self.queue_frame.columnconfigure(0, weight=1)
         self.queue_frame.columnconfigure(1, weight=1)
+        self.queue_frame.rowconfigure(2, weight=1)
+        queue_header = ttk.Frame(self.queue_frame, style="Card.TFrame")
+        queue_header.grid(
+            row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8)
+        )
+        ttk.Label(
+            queue_header, text="Thread queues", style="Section.TLabel"
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            queue_header,
+            text="Priority threads run before the normal queue",
+            style="Muted.Card.TLabel",
+        ).pack(side=tk.RIGHT)
 
-        ttk.Label(self.queue_frame, text="Normal queue").grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Label(self.queue_frame, text="Priority queue").grid(
-            row=0, column=1, sticky="w", padx=(8, 0)
-        )
+        self.normal_count = tk.StringVar(value="0")
+        self.priority_count = tk.StringVar(value="0")
+        normal_header = ttk.Frame(self.queue_frame, style="Card.TFrame")
+        normal_header.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(0, 5))
+        ttk.Label(
+            normal_header, text="Normal", style="Card.TLabel"
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            normal_header,
+            textvariable=self.normal_count,
+            style="Muted.Card.TLabel",
+        ).pack(side=tk.RIGHT)
+        priority_header = ttk.Frame(self.queue_frame, style="Card.TFrame")
+        priority_header.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(0, 5))
+        ttk.Label(
+            priority_header, text="Priority", style="Card.TLabel"
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            priority_header,
+            textvariable=self.priority_count,
+            style="Muted.Card.TLabel",
+        ).pack(side=tk.RIGHT)
+
         self.normal_list = self._make_queue_list(self.queue_frame, 0)
         self.priority_list = self._make_queue_list(self.queue_frame, 1)
         ttk.Button(
             self.queue_frame,
             text="Remove selected",
             command=lambda: self.remove_selected("normal"),
-        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
         ttk.Button(
             self.queue_frame,
             text="Remove selected",
             command=lambda: self.remove_selected("priority"),
-        ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+        ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
 
-        add_frame = ttk.Frame(container)
-        add_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        add_frame = ttk.Frame(
+            container, style="Card.TFrame", padding=(14, 10)
+        )
+        add_frame.grid(
+            row=4, column=0, columnspan=3, sticky="ew", pady=(0, 10)
+        )
         add_frame.columnconfigure(0, weight=1)
         self.url_entry = ttk.Entry(add_frame, textvariable=self.url)
         self.url_entry.grid(
             row=0, column=0, sticky="ew", padx=(0, 8)
         )
+        self.url_entry.bind(
+            "<Return>", lambda _event: self.add_url("normal")
+        )
         self.add_normal_button = ttk.Button(
             add_frame,
-            text="Add normal",
+            text="Add to normal",
             command=lambda: self.add_url("normal"),
         )
         self.add_normal_button.grid(row=0, column=1, padx=(0, 6))
         self.add_priority_button = ttk.Button(
             add_frame,
-            text="Add priority",
+            text="Add to priority",
             command=lambda: self.add_url("priority"),
         )
         self.add_priority_button.grid(row=0, column=2)
 
-        ttk.Label(container, textvariable=self.stats_summary).grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=(0, 4)
+        stats_card = ttk.Frame(
+            container, style="Card.TFrame", padding=(14, 10)
         )
-        ttk.Label(container, text="Live monitor output").grid(
-            row=5, column=0, columnspan=3, sticky="w"
+        stats_card.grid(
+            row=5, column=0, columnspan=3, sticky="ew", pady=(0, 10)
         )
+        ttk.Label(
+            stats_card, text="Lifetime statistics", style="Section.TLabel"
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            stats_card,
+            textvariable=self.stats_summary,
+            style="Muted.Card.TLabel",
+        ).pack(anchor=tk.W, pady=(3, 0))
+
+        output_card = ttk.Frame(
+            container, style="Card.TFrame", padding=(14, 11)
+        )
+        output_card.grid(
+            row=6, column=0, columnspan=3, sticky="nsew", pady=(0, 10)
+        )
+        output_card.columnconfigure(0, weight=1)
+        output_card.rowconfigure(1, weight=1)
+        output_header = ttk.Frame(output_card, style="Card.TFrame")
+        output_header.grid(row=0, column=0, sticky="ew", pady=(0, 7))
+        ttk.Label(
+            output_header, text="Activity log", style="Section.TLabel"
+        ).pack(side=tk.LEFT)
+        self.clear_log_button = ttk.Button(
+            output_header, text="Clear", command=self._clear_output
+        )
+        self.clear_log_button.pack(side=tk.RIGHT)
         self.output = scrolledtext.ScrolledText(
-            container, height=14, wrap=tk.WORD, state=tk.DISABLED
+            output_card,
+            height=12,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            relief=tk.FLAT,
+            borderwidth=0,
+            padx=10,
+            pady=9,
+            background=self.colors["console"],
+            foreground=self.colors["console_text"],
+            insertbackground="#ffffff",
+            selectbackground=self.colors["accent"],
+            font=("Consolas", 9),
         )
-        self.output.grid(row=6, column=0, columnspan=3, sticky="nsew")
+        self.output.grid(row=1, column=0, sticky="nsew")
 
         controls = ttk.Frame(container)
-        controls.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        controls.grid(row=7, column=0, columnspan=3, sticky="ew")
         self.start_button = ttk.Button(
-            controls, text="Start monitoring", command=self.start_monitor
+            controls,
+            text="Start monitoring",
+            style="Primary.TButton",
+            command=self.start_monitor,
         )
         self.start_button.pack(side=tk.LEFT)
         self.pause_button = ttk.Button(
@@ -223,29 +431,53 @@ class MonitorGUI:
             controls, text="Refresh queues", command=self.refresh_queues
         )
         self.refresh_button.pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(
-            controls, textvariable=self.status, width=54, anchor=tk.E
-        ).pack(
-            side=tk.RIGHT, padx=(8, 0)
-        )
         self.download_progress = ttk.Progressbar(
-            controls, mode="indeterminate", length=130
+            controls, mode="indeterminate", length=110, maximum=100
         )
-        self.download_progress.pack(side=tk.RIGHT, padx=(8, 8))
+        self.download_progress.pack(side=tk.RIGHT, padx=(10, 0))
+        self.status_label = ttk.Label(
+            controls, textvariable=self.status, width=38, anchor=tk.E
+        )
+        self.status_label.pack(side=tk.RIGHT, padx=(8, 0))
 
     @staticmethod
-    def _make_queue_list(parent: ttk.LabelFrame, column: int) -> tk.Listbox:
-        frame = ttk.Frame(parent)
-        frame.grid(row=1, column=column, sticky="nsew", padx=(0, 0) if column == 0 else (8, 0))
-        parent.rowconfigure(1, weight=1)
+    def _make_queue_list(parent: ttk.Frame, column: int) -> tk.Listbox:
+        frame = ttk.Frame(parent, style="Card.TFrame")
+        frame.grid(
+            row=2,
+            column=column,
+            sticky="nsew",
+            padx=(0, 8) if column == 0 else (8, 0),
+        )
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
-        listbox = tk.Listbox(frame, selectmode=tk.EXTENDED, height=6)
+        listbox = tk.Listbox(
+            frame,
+            selectmode=tk.EXTENDED,
+            height=7,
+            activestyle="none",
+            relief=tk.SOLID,
+            borderwidth=1,
+            highlightthickness=1,
+            highlightbackground="#dce3ed",
+            highlightcolor="#8eb2f5",
+            background="#ffffff",
+            foreground="#172033",
+            selectbackground="#dbeafe",
+            selectforeground="#1e3a8a",
+            font=("Segoe UI", 9),
+            exportselection=False,
+        )
         scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=listbox.yview)
         listbox.configure(yscrollcommand=scrollbar.set)
         listbox.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
         return listbox
+
+    def _clear_output(self) -> None:
+        self.output.configure(state=tk.NORMAL)
+        self.output.delete("1.0", tk.END)
+        self.output.configure(state=tk.DISABLED)
 
     def _browse(self) -> None:
         selected = filedialog.askdirectory(
@@ -264,6 +496,7 @@ class MonitorGUI:
                 control.configure(state=state)
         self.start_button.configure(state=state)
         self.refresh_button.configure(state=state)
+        self.clear_log_button.configure(state=tk.NORMAL)
         self.pause_button.configure(state=tk.NORMAL if running else tk.DISABLED)
         self.stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
         self._set_queue_controls(running)
@@ -325,6 +558,8 @@ class MonitorGUI:
             return
         self._replace_list(self.normal_list, normal)
         self._replace_list(self.priority_list, priority)
+        self.normal_count.set(f"{len(normal)} threads")
+        self.priority_count.set(f"{len(priority)} threads")
         self._refresh_stats()
         if not self.running:
             self.status.set(f"Stopped | {len(priority)} priority, {len(normal)} normal")
@@ -358,9 +593,26 @@ class MonitorGUI:
 
     @staticmethod
     def _replace_list(listbox: tk.Listbox, urls) -> None:
+        current = listbox.get(0, tk.END)
+        if current == tuple(urls):
+            return
+        selected = {
+            current[index]
+            for index in listbox.curselection()
+            if index < len(current)
+        }
+        try:
+            top_fraction = listbox.yview()[0]
+        except tk.TclError:
+            top_fraction = 0.0
         listbox.delete(0, tk.END)
         for url in urls:
             listbox.insert(tk.END, url)
+        for index, url in enumerate(urls):
+            if url in selected:
+                listbox.selection_set(index)
+        if urls and top_fraction:
+            listbox.yview_moveto(top_fraction)
 
     def _refresh_while_running(self) -> None:
         if self.running:
@@ -464,6 +716,7 @@ class MonitorGUI:
         args.extend(("--stop-file", str(stop_file)))
 
         self.stop_requested = False
+        self.monitor_error = None
         self.owns_pause = False
         self.owns_stop = False
         self.active_directory = directory
@@ -561,7 +814,7 @@ class MonitorGUI:
                     self.status.set("Starting cycle...")
             elif kind == "progress":
                 message, active = value
-                self.status.set(message)
+                self.status.set(self._progress_status(message))
                 if active:
                     if not self.download_progress_running:
                         self.download_progress.start(12)
@@ -570,6 +823,8 @@ class MonitorGUI:
                     self.download_progress.stop()
                     self.download_progress_running = False
             elif kind == "error":
+                self.monitor_error = value
+                self.status.set("Monitor error — see activity log")
                 lines.append(f"[GUI ERROR] {value}\n")
             elif kind == "exit":
                 exited = True
@@ -597,6 +852,8 @@ class MonitorGUI:
                         self._append_output(f"[GUI] Could not remove {name}: {error}\n")
         self.owns_pause = False
         self.owns_stop = False
+        was_stopped_by_user = self.stop_requested
+        self.stop_requested = False
         self.active_directory = None
         self.monitor.stop_event.clear()
         self.monitor.progress_callback = None
@@ -608,9 +865,31 @@ class MonitorGUI:
         if self.closing:
             self.root.destroy()
             return
-        if not self.stop_requested:
+        if self.monitor_error:
+            self.status.set("Stopped after an error")
+        elif was_stopped_by_user:
+            self.status.set("Stopped by user")
+        else:
             self.status.set("Stopped")
         self._append_output("--- Monitor stopped ---\n")
+
+    @staticmethod
+    def _progress_status(message: str) -> str:
+        if message.startswith("Downloading media: "):
+            details = message[len("Downloading media: "):]
+            url, separator, elapsed = details.partition(" (")
+            route_parts = url.split("://", 1)[-1].partition("/")[2].split("/")
+            route = "/".join(route_parts[-3:])
+            label = f"Downloading /{route}" if route else "Downloading media"
+            if separator:
+                label += f" ({elapsed.rstrip(')')})"
+        elif message.startswith("Processing"):
+            label = "Finalizing download…"
+        else:
+            label = message
+        if len(label) > 38:
+            return f"{label[:37]}…"
+        return label
 
     def on_close(self) -> None:
         if self.worker is None:

@@ -523,21 +523,30 @@ def run_gallery_dl(url: str) -> RunResult:
     return RunResult(code, out_bytes.decode("utf-8", "ignore"), err_bytes.decode("utf-8", "ignore"), timed_out=timed_out)
 
 
+def combined_output(res: RunResult) -> str:
+    chunks = []
+    if res.out:
+        chunks.append(res.out)
+    if res.err:
+        chunks.append(res.err)
+    return "\n".join(chunks)
+
+
 def classify(res: RunResult) -> str:
-    err = res.err
-    if UNSUPPORTED_RE.search(err):
+    log_text = combined_output(res)
+    if UNSUPPORTED_RE.search(log_text):
         return "unsupported"
-    if THREAD_GONE_RE.search(err):
+    if THREAD_GONE_RE.search(log_text):
         return "dead"
     if res.code == 0:
-        return "partial" if FILE_GONE_RE.search(err) else "ok"
-    if BLOCKED_RE.search(err):
+        return "partial" if FILE_GONE_RE.search(log_text) else "ok"
+    if BLOCKED_RE.search(log_text):
         return "blocked"
-    failed = len(FAILED_DL_RE.findall(err))
-    dl_404_errs = len(DL_404_ERR_RE.findall(err))
-    other_errors = len(ERROR_LINE_RE.findall(err)) - failed - dl_404_errs
-    non_404_dl_warns = len(DL_WARN_RE.findall(err)) - len(DL_404_WARN_RE.findall(err))
-    if (failed or dl_404_errs) and other_errors == 0 and non_404_dl_warns == 0 and len(FILE_GONE_RE.findall(err)) >= failed:
+    failed = len(FAILED_DL_RE.findall(log_text))
+    dl_404_errs = len(DL_404_ERR_RE.findall(log_text))
+    other_errors = len(ERROR_LINE_RE.findall(log_text)) - failed - dl_404_errs
+    non_404_dl_warns = len(DL_WARN_RE.findall(log_text)) - len(DL_404_WARN_RE.findall(log_text))
+    if (failed or dl_404_errs) and other_errors == 0 and non_404_dl_warns == 0 and len(FILE_GONE_RE.findall(log_text)) >= failed:
         return "partial"
     return "error"
 
@@ -581,7 +590,7 @@ def try_archive_fallback(url: str, counters: Dict[str, int]) -> Optional[bool]:
         if res.timed_out:
             continue
         kind = classify(res)
-        if kind in ("ok", "partial") and bool(res.out.strip()):
+        if kind in ("ok", "partial") and res.out.strip():
             cprint("  [ARCHIVE OK] Recovered from archive, removing from active list", "green")
             log_failure(f"404 ARCHIVED ({arch_url}): {url}")
             counters.setdefault("CYCLE_ARCHIVED", 0)
@@ -682,7 +691,7 @@ def process_thread(
             print()
             return not interruptible_sleep(wait)
         if attempt == CFG.max_retries:
-            detail = last_error_line(res.err)
+            detail = last_error_line(combined_output(res))
             log_failure(f"FAILED max retries: {url}" + (f" | {detail}" if detail else ""))
             cprint("  [FAILED] Keeping in queue for next cycle", "red")
             print()
@@ -738,8 +747,16 @@ def run_self_test() -> int:
             classify(RunResult(4, err="[downloader.http][warning] '429 Too Many Requests' for 'u'\n[download][error] Failed to download 1.jpg")) == "blocked",
         ),
         (
+            "429 warning in stdout is still blocked",
+            classify(RunResult(4, out="[downloader.http][warning] '429 Too Many Requests' for 'u'\n[download][error] Failed to download 1.jpg\n")) == "blocked",
+        ),
+        (
             "recovered 429 warning with exit code 0 is ok",
             classify(RunResult(0, err="[downloader.http][warning] '429 Too Many Requests' for 'u' (1/5)\n")) == "ok",
+        ),
+        (
+            "404 warning in stdout is still treated as partial",
+            classify(RunResult(4, out="[downloader.http][warning] '404 Not Found' for 'https://i.4cdn.org/g/9.jpg'\n[download][error] Failed to download 9.jpg\n")) == "partial",
         ),
         (
             "cloudflare",

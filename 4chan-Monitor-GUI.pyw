@@ -3,20 +3,18 @@
 import contextlib
 import importlib.util
 import io
-import os
 import queue
 import sys
 import threading
 import tkinter as tk
 import traceback
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, ttk
 from types import ModuleType
 from typing import Optional
 
 
 MONITOR_SCRIPT = Path(__file__).with_name("4chan-Monitor.py")
-MAX_LOG_LINES = 4000
 
 
 class QueueWriter:
@@ -28,13 +26,22 @@ class QueueWriter:
         self.pending += text
         while "\n" in self.pending:
             line, self.pending = self.pending.split("\n", 1)
-            self.events.put(("line", line.rstrip("\r")))
+            self._emit_status(line.rstrip("\r"))
         return len(text)
 
     def flush(self) -> None:
         if self.pending:
-            self.events.put(("line", self.pending.rstrip("\r")))
+            self._emit_status(self.pending.rstrip("\r"))
             self.pending = ""
+
+    def _emit_status(self, line: str) -> None:
+        if line.startswith(
+            ("[STARTUP]", "[PAUSED]", "[RESUMED]", "[INTERRUPTED]", "[CYCLE]")
+        ) or any(
+            marker in line
+            for marker in ("[FATAL]", "[OK]", "[FAILED]", "[BLOCKED]", " CYCLE:")
+        ):
+            self.events.put(("line", line))
 
 
 def load_monitor_module(script: Path = MONITOR_SCRIPT) -> ModuleType:
@@ -85,6 +92,7 @@ class MonitorGUI:
         self.stop_requested = False
         self.closing = False
         self.monitor_error: Optional[str] = None
+        self.monitor_error_saved = False
         self.owns_pause = False
         self.owns_stop = False
 
@@ -100,14 +108,24 @@ class MonitorGUI:
         self.cycles = tk.StringVar(value="0")
 
         root.title("4chan Thread Monitor")
-        root.geometry("1080x800")
-        root.minsize(820, 620)
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        width = min(
+            1100, max(320, screen_width - 24), max(700, int(screen_width * 0.9))
+        )
+        height = min(
+            820, max(320, screen_height - 70), max(510, int(screen_height * 0.94))
+        )
+        root.geometry(f"{width}x{height}")
+        root.minsize(min(700, screen_width - 24), min(500, screen_height - 80))
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.report_callback_exception = self._report_callback_exception
         self._configure_styles()
         self._build_ui()
+        root.bind("<Configure>", self._on_resize)
         self._set_running(False)
         self.refresh_queues()
+        self._set_wraplength(width)
         root.after(100, self._drain_events)
         root.after(1500, self._refresh_while_running)
 
@@ -126,8 +144,6 @@ class MonitorGUI:
             "muted": "#667085",
             "accent": "#2563eb",
             "accent_active": "#1d4ed8",
-            "console": "#111827",
-            "console_text": "#e5e7eb",
         }
         self.root.configure(background=self.colors["background"])
         style.configure("TFrame", background=self.colors["background"])
@@ -150,12 +166,6 @@ class MonitorGUI:
             font=("Segoe UI", 20, "bold"),
         )
         style.configure(
-            "Subtitle.TLabel",
-            background=self.colors["background"],
-            foreground=self.colors["muted"],
-            font=("Segoe UI", 9),
-        )
-        style.configure(
             "Section.TLabel",
             background=self.colors["surface"],
             foreground=self.colors["text"],
@@ -165,6 +175,12 @@ class MonitorGUI:
             "Muted.Card.TLabel",
             background=self.colors["surface"],
             foreground=self.colors["muted"],
+        )
+        style.configure(
+            "Status.TLabel",
+            background=self.colors["background"],
+            foreground=self.colors["text"],
+            font=("Segoe UI", 9, "bold"),
         )
         style.configure(
             "Primary.TButton",
@@ -204,36 +220,24 @@ class MonitorGUI:
             "TCheckbutton",
             background=[("active", self.colors["surface"])],
         )
-        style.configure(
-            "Horizontal.TProgressbar",
-            background=self.colors["accent"],
-            troughcolor="#e7edf5",
-            bordercolor="#e7edf5",
-            lightcolor=self.colors["accent"],
-            darkcolor=self.colors["accent"],
-        )
-
     def _build_ui(self) -> None:
-        container = ttk.Frame(self.root, padding=(22, 18))
+        container = ttk.Frame(self.root, padding=(10, 8))
+        self.container = container
         container.pack(fill=tk.BOTH, expand=True)
         container.columnconfigure(1, weight=1)
         container.rowconfigure(3, weight=3)
         container.rowconfigure(6, weight=2)
 
         header = ttk.Frame(container)
-        header.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+        self.header_frame = header
+        header.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
         ttk.Label(
             header, text="4chan Thread Monitor", style="Title.TLabel"
         ).pack(anchor=tk.W)
-        ttk.Label(
-            header,
-            text="Manage thread queues and monitor downloads from one window.",
-            style="Subtitle.TLabel",
-        ).pack(anchor=tk.W, pady=(2, 0))
-
         folder_card = ttk.Frame(
-            container, style="Card.TFrame", padding=(14, 12)
+            container, style="Card.TFrame", padding=(10, 8)
         )
+        self.folder_card = folder_card
         folder_card.grid(
             row=1, column=0, columnspan=3, sticky="ew", pady=(0, 10)
         )
@@ -251,34 +255,38 @@ class MonitorGUI:
         self.browse_button.grid(row=0, column=2, padx=(8, 0))
 
         options = ttk.Frame(
-            container, style="Card.TFrame", padding=(14, 10)
+            container, style="Card.TFrame", padding=(10, 7)
         )
         self.options_frame = options
         options.grid(
             row=2, column=0, columnspan=3, sticky="ew", pady=(0, 10)
         )
-        ttk.Checkbutton(
+        update_check = ttk.Checkbutton(
             options,
             text="Check gallery-dl updates at startup",
             variable=self.check_updates,
-        ).pack(side=tk.LEFT)
-        ttk.Checkbutton(
+        )
+        update_check.grid(row=0, column=0, sticky="w")
+        archive_check = ttk.Checkbutton(
             options,
             text="Try archive mirrors for dead threads",
             variable=self.use_archive,
-        ).pack(side=tk.LEFT, padx=(20, 0))
-        ttk.Label(
+        )
+        self.archive_check = archive_check
+        archive_check.grid(row=0, column=1, sticky="w", padx=(14, 0))
+        self.cycles_label = ttk.Label(
             options,
             text="Cycles (0 = forever)",
             style="Muted.Card.TLabel",
-        ).pack(side=tk.LEFT, padx=(20, 8))
+        )
+        self.cycles_label.grid(row=0, column=2, sticky="e", padx=(18, 8))
         self.cycles_entry = ttk.Spinbox(
             options, from_=0, to=100000, width=8, textvariable=self.cycles
         )
-        self.cycles_entry.pack(side=tk.LEFT)
+        self.cycles_entry.grid(row=0, column=3, sticky="w")
 
         self.queue_frame = ttk.Frame(
-            container, style="Card.TFrame", padding=(14, 12)
+            container, style="Card.TFrame", padding=(10, 8)
         )
         self.queue_frame.grid(
             row=3, column=0, columnspan=3, sticky="nsew", pady=(0, 10)
@@ -287,18 +295,13 @@ class MonitorGUI:
         self.queue_frame.columnconfigure(1, weight=1)
         self.queue_frame.rowconfigure(2, weight=1)
         queue_header = ttk.Frame(self.queue_frame, style="Card.TFrame")
+        self.queue_header = queue_header
         queue_header.grid(
             row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8)
         )
         ttk.Label(
             queue_header, text="Thread queues", style="Section.TLabel"
         ).pack(side=tk.LEFT)
-        ttk.Label(
-            queue_header,
-            text="Priority threads run before the normal queue",
-            style="Muted.Card.TLabel",
-        ).pack(side=tk.RIGHT)
-
         self.normal_count = tk.StringVar(value="0")
         self.priority_count = tk.StringVar(value="0")
         normal_header = ttk.Frame(self.queue_frame, style="Card.TFrame")
@@ -336,8 +339,9 @@ class MonitorGUI:
         ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
 
         add_frame = ttk.Frame(
-            container, style="Card.TFrame", padding=(14, 10)
+            container, style="Card.TFrame", padding=(10, 7)
         )
+        self.add_frame = add_frame
         add_frame.grid(
             row=4, column=0, columnspan=3, sticky="ew", pady=(0, 10)
         )
@@ -363,28 +367,28 @@ class MonitorGUI:
         self.add_priority_button.grid(row=0, column=2)
 
         stats_card = ttk.Frame(
-            container, style="Card.TFrame", padding=(14, 10)
+            container, style="Card.TFrame", padding=(10, 7)
         )
+        self.stats_card = stats_card
         stats_card.grid(
             row=5, column=0, columnspan=3, sticky="ew", pady=(0, 10)
         )
-        ttk.Label(
-            stats_card, text="Lifetime statistics", style="Section.TLabel"
-        ).pack(anchor=tk.W)
-        ttk.Label(
+        self.stats_label = ttk.Label(
             stats_card,
             textvariable=self.stats_summary,
             style="Muted.Card.TLabel",
-        ).pack(anchor=tk.W, pady=(3, 0))
+        )
+        self.stats_label.pack(anchor=tk.W)
 
         output_card = ttk.Frame(
-            container, style="Card.TFrame", padding=(14, 11)
+            container, style="Card.TFrame", padding=(10, 8)
         )
+        self.downloads_card = output_card
         output_card.grid(
             row=6, column=0, columnspan=3, sticky="nsew", pady=(0, 10)
         )
         output_card.columnconfigure(0, weight=1)
-        output_card.rowconfigure(3, weight=1)
+        output_card.rowconfigure(1, weight=1)
         downloads_header = ttk.Frame(output_card, style="Card.TFrame")
         downloads_header.grid(row=0, column=0, sticky="ew", pady=(0, 5))
         ttk.Label(
@@ -401,13 +405,14 @@ class MonitorGUI:
             style="Muted.Card.TLabel",
         ).pack(side=tk.RIGHT)
         files_frame = ttk.Frame(output_card, style="Card.TFrame")
-        files_frame.grid(row=1, column=0, sticky="ew", pady=(0, 9))
+        files_frame.grid(row=1, column=0, sticky="nsew")
+        files_frame.rowconfigure(0, weight=1)
         files_frame.columnconfigure(0, weight=1)
         self.downloaded_files_view = ttk.Treeview(
             files_frame,
             columns=("path", "size"),
             show="headings",
-            height=4,
+            height=5,
             selectmode="browse",
         )
         self.downloaded_files_view.heading("path", text="File")
@@ -419,38 +424,21 @@ class MonitorGUI:
         files_scrollbar = ttk.Scrollbar(
             files_frame, orient=tk.VERTICAL, command=self.downloaded_files_view.yview
         )
-        self.downloaded_files_view.configure(yscrollcommand=files_scrollbar.set)
-        self.downloaded_files_view.grid(row=0, column=0, sticky="ew")
+        files_horizontal_scrollbar = ttk.Scrollbar(
+            files_frame,
+            orient=tk.HORIZONTAL,
+            command=self.downloaded_files_view.xview,
+        )
+        self.downloaded_files_view.configure(
+            yscrollcommand=files_scrollbar.set,
+            xscrollcommand=files_horizontal_scrollbar.set,
+        )
+        self.downloaded_files_view.grid(row=0, column=0, sticky="nsew")
         files_scrollbar.grid(row=0, column=1, sticky="ns")
-
-        output_header = ttk.Frame(output_card, style="Card.TFrame")
-        output_header.grid(row=2, column=0, sticky="ew", pady=(0, 5))
-        ttk.Label(
-            output_header, text="Activity log", style="Section.TLabel"
-        ).pack(side=tk.LEFT)
-        self.clear_log_button = ttk.Button(
-            output_header, text="Clear", command=self._clear_output
-        )
-        self.clear_log_button.pack(side=tk.RIGHT)
-        self.output = scrolledtext.ScrolledText(
-            output_card,
-            height=12,
-            wrap=tk.WORD,
-            state=tk.DISABLED,
-            relief=tk.FLAT,
-            borderwidth=0,
-            padx=10,
-            pady=9,
-            background=self.colors["console"],
-            foreground=self.colors["console_text"],
-            insertbackground="#ffffff",
-            selectbackground=self.colors["accent"],
-            font=("Consolas", 9),
-        )
-        self.output.grid(row=3, column=0, sticky="nsew")
+        files_horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
 
         controls = ttk.Frame(container)
-        controls.grid(row=7, column=0, columnspan=3, sticky="ew")
+        controls.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         self.start_button = ttk.Button(
             controls,
             text="Start monitoring",
@@ -471,9 +459,16 @@ class MonitorGUI:
         )
         self.refresh_button.pack(side=tk.LEFT, padx=(8, 0))
         self.status_label = ttk.Label(
-            controls, textvariable=self.status, width=44, anchor=tk.E
+            container,
+            textvariable=self.status,
+            style="Status.TLabel",
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=900,
         )
-        self.status_label.pack(side=tk.RIGHT, padx=(8, 0), fill=tk.X, expand=True)
+        self.status_label.grid(
+            row=7, column=0, columnspan=3, sticky="ew", pady=(0, 0)
+        )
 
     @staticmethod
     def _make_queue_list(parent: ttk.Frame, column: int) -> tk.Listbox:
@@ -489,7 +484,7 @@ class MonitorGUI:
         listbox = tk.Listbox(
             frame,
             selectmode=tk.EXTENDED,
-            height=7,
+            height=5,
             activestyle="none",
             relief=tk.SOLID,
             borderwidth=1,
@@ -504,15 +499,17 @@ class MonitorGUI:
             exportselection=False,
         )
         scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=listbox.yview)
-        listbox.configure(yscrollcommand=scrollbar.set)
+        horizontal_scrollbar = ttk.Scrollbar(
+            frame, orient=tk.HORIZONTAL, command=listbox.xview
+        )
+        listbox.configure(
+            yscrollcommand=scrollbar.set,
+            xscrollcommand=horizontal_scrollbar.set,
+        )
         listbox.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
+        horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
         return listbox
-
-    def _clear_output(self) -> None:
-        self.output.configure(state=tk.NORMAL)
-        self.output.delete("1.0", tk.END)
-        self.output.configure(state=tk.DISABLED)
 
     def _clear_downloaded_files(self) -> None:
         self.downloaded_files_view.delete(
@@ -583,7 +580,6 @@ class MonitorGUI:
                 control.configure(state=state)
         self.start_button.configure(state=state)
         self.refresh_button.configure(state=state)
-        self.clear_log_button.configure(state=tk.NORMAL)
         self.pause_button.configure(state=tk.NORMAL if running else tk.DISABLED)
         self.stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
         self._set_queue_controls(running)
@@ -604,19 +600,31 @@ class MonitorGUI:
                     if isinstance(nested, tk.Listbox):
                         nested.configure(state=state)
 
-    def _append_output(self, lines: str) -> None:
-        self.output.configure(state=tk.NORMAL)
-        self.output.insert(tk.END, lines)
-        line_count = int(self.output.index("end-1c").split(".")[0])
-        if line_count > MAX_LOG_LINES:
-            self.output.delete("1.0", f"{line_count - MAX_LOG_LINES}.0")
-        self.output.see(tk.END)
-        self.output.configure(state=tk.DISABLED)
-
     def _report_callback_exception(self, exception_type, error, tb) -> None:
         detail = "".join(traceback.format_exception(exception_type, error, tb))
-        self._append_output(f"[GUI ERROR]\n{detail}\n")
-        self.status.set(f"GUI error: {error}")
+        saved = self._save_runtime_error(detail)
+        details = (
+            f"Details saved to {self._error_log_path()}"
+            if saved
+            else "Could not save the error details to a file."
+        )
+        self.status.set(f"GUI error: {error}. {details}")
+        messagebox.showerror(
+            "GUI error",
+            f"{error}\n\n{details}",
+            parent=self.root,
+        )
+
+    @staticmethod
+    def _error_log_path() -> Path:
+        return Path(__file__).with_suffix(".error.log")
+
+    def _save_runtime_error(self, detail: str) -> bool:
+        try:
+            self._error_log_path().write_text(detail, encoding="utf-8")
+        except OSError:
+            return False
+        return True
 
     def _queue_path(self, queue_name: str) -> Path:
         filename = (
@@ -639,7 +647,7 @@ class MonitorGUI:
             priority = self._read_queue("priority")
         except OSError as error:
             if self.running:
-                self.events.put(("line", f"[GUI] Queue refresh failed: {error}"))
+                self.status.set(f"Queue refresh failed: {error}")
             else:
                 self.status.set(f"Queue read error: {error}")
             return
@@ -804,6 +812,7 @@ class MonitorGUI:
 
         self.stop_requested = False
         self.monitor_error = None
+        self.monitor_error_saved = False
         self.owns_pause = False
         self.owns_stop = False
         self.active_directory = directory
@@ -816,7 +825,6 @@ class MonitorGUI:
             text="Resume" if (directory / "pause_4chan.txt").exists() else "Pause"
         )
         self.status.set("Starting...")
-        self._append_output("\n--- Monitor started ---\n")
         self.worker = threading.Thread(
             target=self._run_monitor, args=(args,), daemon=True
         )
@@ -828,10 +836,15 @@ class MonitorGUI:
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
                 self.monitor.main(args, working_directory=self.active_directory)
         except SystemExit as error:
-            return_code = error.code if isinstance(error.code, int) else 1
-            self.events.put(("error", f"Monitor exited with code {return_code}"))
+            if error.code not in (None, 0):
+                return_code = error.code if isinstance(error.code, int) else 1
+                detail = f"Monitor exited with code {return_code}"
+                self.monitor_error_saved = self._save_runtime_error(detail)
+                self.events.put(("error", detail))
         except Exception:
-            self.events.put(("error", traceback.format_exc()))
+            detail = traceback.format_exc()
+            self.monitor_error_saved = self._save_runtime_error(detail)
+            self.events.put(("error", detail))
         finally:
             writer.flush()
             self.events.put(("exit", None))
@@ -841,6 +854,65 @@ class MonitorGUI:
 
     def _queue_download_output(self, line: str, stream: str) -> None:
         self.events.put(("download_output", (line, stream)))
+
+    def _on_resize(self, event) -> None:
+        if event.widget is self.root:
+            compact = event.height < 640
+            very_compact = event.height < 560
+            self.container.configure(
+                padding=(6, 4) if very_compact else (8, 6) if compact else (10, 8)
+            )
+            card_padding = (6, 4) if compact else (10, 8)
+            for card in (
+                self.folder_card,
+                self.options_frame,
+                self.queue_frame,
+                self.add_frame,
+                self.stats_card,
+                self.downloads_card,
+            ):
+                card.configure(padding=card_padding)
+                card.grid_configure(pady=(0, 4) if compact else (0, 10))
+            self.header_frame.grid_configure(
+                pady=(0, 4) if compact else (0, 8)
+            )
+            if very_compact:
+                self.header_frame.grid_remove()
+                self.queue_header.grid_remove()
+            else:
+                self.header_frame.grid()
+                self.queue_header.grid()
+            self.normal_list.configure(height=2 if very_compact else 3 if compact else 5)
+            self.priority_list.configure(height=2 if very_compact else 3 if compact else 5)
+            self.downloaded_files_view.configure(
+                height=2 if very_compact else 3 if compact else 5
+            )
+            self.downloaded_files_view.column(
+                "path", width=max(160, event.width - 190)
+            )
+            if event.width < 800:
+                self.archive_check.grid(
+                    row=1, column=0, sticky="w", pady=(4, 0)
+                )
+                self.cycles_label.grid(
+                    row=1, column=1, sticky="e", padx=(14, 8), pady=(4, 0)
+                )
+                self.cycles_entry.grid(
+                    row=1, column=2, sticky="w", pady=(4, 0)
+                )
+            else:
+                self.archive_check.grid(
+                    row=0, column=1, sticky="w", padx=(14, 0)
+                )
+                self.cycles_label.grid(
+                    row=0, column=2, sticky="e", padx=(18, 8)
+                )
+                self.cycles_entry.grid(row=0, column=3, sticky="w")
+            self._set_wraplength(event.width)
+
+    def _set_wraplength(self, width: int) -> None:
+        self.status_label.configure(wraplength=max(280, width - 48))
+        self.stats_label.configure(wraplength=max(280, width - 64))
 
     def toggle_pause(self) -> None:
         if not self.running or self.stop_requested or self.active_directory is None:
@@ -883,7 +955,6 @@ class MonitorGUI:
         self.status.set("Stopping gracefully...")
 
     def _drain_events(self) -> None:
-        lines = []
         exited = False
         for _ in range(300):
             try:
@@ -891,7 +962,6 @@ class MonitorGUI:
             except queue.Empty:
                 break
             if kind == "line":
-                lines.append(value + "\n")
                 if value.startswith("[PAUSED]"):
                     self.status.set("Paused")
                 elif value.startswith("[RESUMED]"):
@@ -913,12 +983,10 @@ class MonitorGUI:
                     self._record_downloaded_file(line)
             elif kind == "error":
                 self.monitor_error = value
-                self.status.set("Monitor error — see activity log")
-                lines.append(f"[GUI ERROR] {value}\n")
+                summary = value.strip().splitlines()[-1] if value.strip() else "Unknown error"
+                self.status.set(f"Monitor error: {summary}")
             elif kind == "exit":
                 exited = True
-        if lines:
-            self._append_output("".join(lines))
         if exited:
             self._monitor_exited()
             if self.closing:
@@ -938,7 +1006,7 @@ class MonitorGUI:
                     except FileNotFoundError:
                         pass
                     except OSError as error:
-                        self._append_output(f"[GUI] Could not remove {name}: {error}\n")
+                        self.status.set(f"Could not remove {name}: {error}")
         self.owns_pause = False
         self.owns_stop = False
         was_stopped_by_user = self.stop_requested
@@ -953,29 +1021,35 @@ class MonitorGUI:
             self.root.destroy()
             return
         if self.monitor_error:
-            self.status.set("Stopped after an error")
+            summary = self.monitor_error.strip().splitlines()[-1]
+            self.status.set(f"Stopped after error: {summary}")
+            details = (
+                f"Full details were saved to:\n{self._error_log_path()}"
+                if self.monitor_error_saved
+                else summary
+            )
+            messagebox.showerror(
+                "Monitor stopped with an error",
+                f"{summary}\n\n{details}",
+                parent=self.root,
+            )
         elif was_stopped_by_user:
             self.status.set("Stopped by user")
         else:
             self.status.set("Stopped")
-        self._append_output("--- Monitor stopped ---\n")
 
     @staticmethod
     def _progress_status(message: str) -> str:
         if message.startswith("Downloading media: "):
             details = message[len("Downloading media: "):]
-            url, separator, elapsed = details.partition(" (")
-            route_parts = url.split("://", 1)[-1].partition("/")[2].split("/")
-            route = "/".join(route_parts[-3:])
-            label = f"Downloading /{route}" if route else "Downloading media"
+            _, separator, elapsed = details.partition(" (")
+            label = "Downloading media…"
             if separator:
                 label += f" ({elapsed.rstrip(')')})"
         elif message.startswith("Processing"):
             label = "Finalizing download…"
         else:
-            label = message
-        if len(label) > 38:
-            return f"{label[:37]}…"
+            return message
         return label
 
     def on_close(self) -> None:

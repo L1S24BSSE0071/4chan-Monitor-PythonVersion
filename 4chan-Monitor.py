@@ -312,18 +312,21 @@ def absorb_new_box() -> int:
         return 0
     known = {dedupe_key(u) for u in existing}
     added: List[str] = []
+    events: List[tuple] = []
     dupes = 0
     for url in parse_urls(raw.decode("utf-8", errors="ignore")):
         key = dedupe_key(url)
         if key in known:
-            cprint(f"  [DUPLICATE] {url}", "yellow")
+            events.append((f"  [DUPLICATE] {url}", "yellow"))
             dupes += 1
         else:
             known.add(key)
             added.append(url)
-            cprint(f"  [ADDED] {url}", "green")
+            events.append((f"  [ADDED] {url}", "green"))
     if added and not safe_write(CFG.list_file, "\n".join(existing + added) + "\n"):
         return 0
+    for msg, color in events:
+        cprint(msg, color)
     if added or dupes:
         cprint(f"[INFO] Merge complete: {len(added)} added, {dupes} duplicates", "cyan")
         print()
@@ -687,7 +690,7 @@ def main() -> None:
                 ("NORMAL", u) for u in queue_urls if dedupe_key(u) not in prio_keys
             ]
             if not jobs:
-                if args.dry_run:
+                if args.dry_run or max_loops > 0:
                     cprint(f"[WAIT] No threads queued ({CFG.list_file}).", "yellow")
                     break
                 cprint(f"[WAIT] No threads queued ({CFG.list_file}). Waiting 60s...", "yellow")
@@ -732,7 +735,7 @@ def main() -> None:
             if not args.dry_run:
                 save_stats(totals)
             if stop_event.is_set():
-                cprint("\n[INTERRUPTED] Stats saved, exiting...", "yellow")
+                cprint("\n[INTERRUPTED] Exiting..." if args.dry_run else "\n[INTERRUPTED] Stats saved, exiting...", "yellow")
                 break
             print()
             cprint("-" * 71, "cyan")

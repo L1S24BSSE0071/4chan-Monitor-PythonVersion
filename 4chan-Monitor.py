@@ -239,7 +239,8 @@ def check_gallery_dl() -> str:
 
 
 def _version_tuple(v: str) -> tuple:
-    return tuple(int(x) for x in re.findall(r"\d+", v.split("-")[0])[:4])
+    nums = [int(x) for x in re.findall(r"\d+", v.split("-")[0])[:4]]
+    return tuple(nums + [0] * (4 - len(nums)))
 
 
 def check_pypi_update(ver_raw: str) -> None:
@@ -293,7 +294,7 @@ COUNTER_MAP = {
 def load_stats() -> Dict[str, int]:
     stats = DEFAULT_STATS.copy()
     try:
-        lines = CFG.stats_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+        lines = CFG.stats_file.read_text(encoding="utf-8-sig", errors="ignore").splitlines()
     except OSError:
         return stats
     for line in lines:
@@ -301,7 +302,7 @@ def load_stats() -> Dict[str, int]:
         k = k.strip()
         if sep and k in stats:
             with contextlib.suppress(ValueError):
-                stats[k] = int(v.strip())
+                stats[k] = max(0, int(v.strip()))
     return stats
 
 
@@ -498,6 +499,7 @@ def process_thread(
     counters: Dict[str, int],
     dead_list: List[str],
     thread_sleep: int,
+    has_more_work: bool = True,
 ) -> bool:
     wait_if_paused()
     if stop_event.is_set():
@@ -554,6 +556,11 @@ def process_thread(
             return True
         if kind == "blocked":
             log_failure(f"BLOCKED: {url}")
+            counters["CYCLE_BLOCKED"] += 1
+            if not has_more_work:
+                cprint("  [BLOCKED] Rate-limited", "red")
+                print()
+                return True
             wait = CFG.blocked_sleep
             cprint(
                 f"  [BLOCKED] Rate-limited, pausing {wait}s"
@@ -562,7 +569,6 @@ def process_thread(
                 "red",
             )
             print()
-            counters["CYCLE_BLOCKED"] += 1
             return not interruptible_sleep(wait)
         if attempt == CFG.max_retries:
             detail = last_error_line(res.err)
@@ -619,6 +625,7 @@ def run_self_test() -> int:
         ("downloader 404 error is partial, not dead thread", classify(RunResult(4, err=dl_err_gone)) == "partial"),
         ("404 image + timeout image is retried as error", classify(RunResult(4, err=mixed_dl_err)) == "error"),
         ("network error is retried", classify(RunResult(4, err="[4chan][error] ConnectionError: boom")) == "error"),
+        ("version tuple padding", _version_tuple("1.28") == _version_tuple("1.28.0") and _version_tuple("1.29") > _version_tuple("1.28.9")),
     ]
     failed = [name for name, ok in cases if not ok]
     for name, ok in cases:
@@ -758,9 +765,12 @@ def main() -> None:
                 "CYCLE_UNSUPPORTED": 0,
             }
             dead_accum: List[str] = []
+            is_last_cycle = max_loops > 0 and current_loop >= max_loops
             for idx, (label, url) in enumerate(jobs):
-                pause_s = thread_sleep if idx < queue_size - 1 else 0
-                if not process_thread(url, label, args.dry_run, counters, dead_accum, pause_s):
+                not_last_job = idx < queue_size - 1
+                pause_s = thread_sleep if not_last_job else 0
+                has_more = not_last_job or not is_last_cycle
+                if not process_thread(url, label, args.dry_run, counters, dead_accum, pause_s, has_more):
                     break
             if dead_accum:
                 remove_dead(dead_accum)

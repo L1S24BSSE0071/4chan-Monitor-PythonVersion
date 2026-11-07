@@ -39,6 +39,7 @@ class Config:
     blocked_sleep: int = 300
     retry_sleep: int = 10
     sleep_request: str = "2.0"
+    use_archive_fallback: bool = True
 
 
 CFG = Config()
@@ -46,6 +47,18 @@ CFG = Config()
 URL_RE = re.compile(r"^https?://[^\s/]+", re.IGNORECASE)
 NOT_PRINTABLE_RE = re.compile(r"[^\x20-\x7E]+")
 THREAD_RE = re.compile(r"^https?://boards\.4chan(?:nel)?\.org/([a-z0-9]+)/thread/(\d+)(?:[/?#]|$)", re.IGNORECASE)
+
+ARCHIVE_MAP = {
+    "desuarchive.org": {
+        "a", "aco", "an", "c", "co", "d", "fit", "g", "his", "int",
+        "k", "m", "mlp", "mu", "q", "qa", "r9k", "tg", "trash", "vr", "wsg",
+    },
+    "arch.b4k.co": {"v", "vg", "vm", "vmg", "vp", "vrpg", "vst"},
+    "4plebs.org": {"adv", "f", "hr", "mlpol", "mo", "o", "pol", "s4s", "sp", "trv", "tv", "x"},
+    "warosu.org": {"3", "biz", "cgl", "ck", "diy", "fa", "ic", "jp", "lit", "sci", "vt"},
+    "palanq.win": {"e", "n", "news", "out", "p", "pw", "toy", "vip", "w", "wg", "wsr"},
+    "thebarchive.com": {"b", "bant"},
+}
 
 THREAD_GONE_RE = re.compile(
     r"\[(?!(?:downloader\b|download\]))[^\]]+\]\[error\]\s+(?:HttpError:\s*'?(?:404|410)\b|NotFoundError:)",
@@ -190,6 +203,19 @@ def dedupe_key(url: str) -> str:
     return url.split("#", 1)[0].rstrip("/").lower()
 
 
+def archive_urls_for(url: str) -> List[str]:
+    m = THREAD_RE.match(url)
+    if not m:
+        return []
+    board, tid = m.group(1).lower(), m.group(2)
+    urls: List[str] = []
+    for host, boards in ARCHIVE_MAP.items():
+        if board in boards:
+            urls.append(f"https://{host}/{board}/thread/{tid}")
+    urls.append(f"https://archived.moe/{board}/thread/{tid}")
+    return urls
+
+
 def parse_urls(text: str) -> List[str]:
     seen: Set[str] = set()
     out: List[str] = []
@@ -278,6 +304,7 @@ DEFAULT_STATS = {
     "TOTAL_CYCLES": 0,
     "TOTAL_SUCCESS": 0,
     "TOTAL_404": 0,
+    "TOTAL_ARCHIVED": 0,
     "TOTAL_BLOCKED": 0,
     "TOTAL_FAILED": 0,
     "TOTAL_UNSUPPORTED": 0,
@@ -285,6 +312,7 @@ DEFAULT_STATS = {
 COUNTER_MAP = {
     "TOTAL_SUCCESS": "CYCLE_SUCCESS",
     "TOTAL_404": "CYCLE_404",
+    "TOTAL_ARCHIVED": "CYCLE_ARCHIVED",
     "TOTAL_BLOCKED": "CYCLE_BLOCKED",
     "TOTAL_FAILED": "CYCLE_FAILED",
     "TOTAL_UNSUPPORTED": "CYCLE_UNSUPPORTED",
@@ -500,6 +528,31 @@ def log_failure(msg: str) -> None:
             f.write(f"[{ts}] {msg}\n")
 
 
+def try_archive_fallback(url: str, counters: Dict[str, int]) -> Optional[bool]:
+    arch_urls = archive_urls_for(url)
+    if not arch_urls:
+        return False
+    cprint("  [404] Thread dead on 4chan, trying archive fallback...", "yellow")
+    for arch_url in arch_urls:
+        wait_if_paused()
+        if stop_event.is_set():
+            return None
+        cprint(f"  [ARCHIVE] {arch_url}", "cyan")
+        res = run_gallery_dl(arch_url)
+        if res.interrupted or stop_event.is_set():
+            return None
+        if res.timed_out:
+            continue
+        if classify(res) in ("ok", "partial"):
+            cprint("  [ARCHIVE OK] Recovered from archive, removing from active list", "green")
+            log_failure(f"404 ARCHIVED ({arch_url}): {url}")
+            counters.setdefault("CYCLE_ARCHIVED", 0)
+            counters["CYCLE_ARCHIVED"] += 1
+            return True
+    cprint("  [ARCHIVE MISS] Not found in archive, removing from list", "yellow")
+    return False
+
+
 def process_thread(
     url: str,
     label: str,
@@ -508,6 +561,7 @@ def process_thread(
     dead_list: List[str],
     thread_sleep: int,
     has_more_work: bool = True,
+    use_archive: bool = True,
 ) -> bool:
     wait_if_paused()
     if stop_event.is_set():
@@ -556,9 +610,16 @@ def process_thread(
             counters["CYCLE_UNSUPPORTED"] += 1
             return True
         if kind == "dead":
-            log_failure(f"404 REMOVED: {url}")
+            if use_archive and CFG.use_archive_fallback and archive_urls_for(url):
+                archived = try_archive_fallback(url, counters)
+                if archived is None:
+                    return False
+                if not archived:
+                    log_failure(f"404 REMOVED (archive miss): {url}")
+            else:
+                log_failure(f"404 REMOVED: {url}")
+                cprint("  [404] Thread not found, removing from list", "yellow")
             dead_list.append(url)
-            cprint("  [404] Thread not found, removing from list", "yellow")
             print()
             counters["CYCLE_404"] += 1
             return True
@@ -635,6 +696,11 @@ def run_self_test() -> int:
         ("network error is retried", classify(RunResult(4, err="[4chan][error] ConnectionError: boom")) == "error"),
         ("version tuple padding", _version_tuple("1.28") == _version_tuple("1.28.0") and _version_tuple("1.29") > _version_tuple("1.28.9")),
         ("last_error_line includes downloader warning context", "ReadTimeoutError" in last_error_line(mixed_dl_err)),
+        (
+            "archive fallback URL generation",
+            archive_urls_for("https://boards.4chan.org/g/thread/123/slug")
+            == ["https://desuarchive.org/g/thread/123", "https://archived.moe/g/thread/123"],
+        ),
     ]
     failed = [name for name, ok in cases if not ok]
     for name, ok in cases:
@@ -653,6 +719,7 @@ def main() -> None:
     parser.add_argument("--no-clear", action="store_true", help="Don't clear screen between cycles")
     parser.add_argument("--no-pause", action="store_true", help="Don't wait for a key press before exiting")
     parser.add_argument("--no-update-check", action="store_true", help="Skip the PyPI update check at startup")
+    parser.add_argument("--no-archive", action="store_true", help="Skip archive fallback when a thread 404s")
     parser.add_argument("--self-test", action="store_true", help="Run internal self-tests")
     args = parser.parse_args()
 
@@ -768,6 +835,7 @@ def main() -> None:
             counters = {
                 "CYCLE_SUCCESS": 0,
                 "CYCLE_404": 0,
+                "CYCLE_ARCHIVED": 0,
                 "CYCLE_BLOCKED": 0,
                 "CYCLE_FAILED": 0,
                 "CYCLE_SKIPPED": 0,
@@ -779,7 +847,9 @@ def main() -> None:
                 not_last_job = idx < queue_size - 1
                 pause_s = thread_sleep if not_last_job else 0
                 has_more = not_last_job or not is_last_cycle
-                if not process_thread(url, label, args.dry_run, counters, dead_accum, pause_s, has_more):
+                if not process_thread(
+                    url, label, args.dry_run, counters, dead_accum, pause_s, has_more, not args.no_archive
+                ):
                     break
             removed_count = remove_dead(dead_accum) if dead_accum else 0
             for total_key, cycle_key in COUNTER_MAP.items():
@@ -795,13 +865,14 @@ def main() -> None:
             cprint("-" * 71, "cyan")
             cprint(f"  Success     : {counters['CYCLE_SUCCESS']}", "green")
             cprint(f"  404 Removed : {counters['CYCLE_404']}", "yellow")
+            cprint(f"  Archived    : {counters['CYCLE_ARCHIVED']}", "cyan")
             cprint(f"  Blocked     : {counters['CYCLE_BLOCKED']}", "yellow")
             cprint(f"  Unsupported : {counters['CYCLE_UNSUPPORTED']}", "yellow")
             cprint(f"  Failed      : {counters['CYCLE_FAILED']}", "red")
             cprint(f"  Skipped     : {counters['CYCLE_SKIPPED']}", "gray")
             cprint("-" * 71, "cyan")
             cprint(
-                f" ALL-TIME  Cycles:{totals['TOTAL_CYCLES']}  OK:{totals['TOTAL_SUCCESS']}  404:{totals['TOTAL_404']}  Blocked:{totals['TOTAL_BLOCKED']}  Failed:{totals['TOTAL_FAILED']}  Unsupported:{totals['TOTAL_UNSUPPORTED']}",
+                f" ALL-TIME  Cycles:{totals['TOTAL_CYCLES']}  OK:{totals['TOTAL_SUCCESS']}  404:{totals['TOTAL_404']}  Archived:{totals['TOTAL_ARCHIVED']}  Blocked:{totals['TOTAL_BLOCKED']}  Failed:{totals['TOTAL_FAILED']}  Unsupported:{totals['TOTAL_UNSUPPORTED']}",
                 "white",
             )
             cprint("-" * 71, "cyan")
@@ -832,6 +903,7 @@ def main() -> None:
     cprint(f"  Sessions    : {totals['TOTAL_SESSIONS']}   (cycles: {totals['TOTAL_CYCLES']})", "white")
     cprint(f"  Success     : {totals['TOTAL_SUCCESS']}", "green")
     cprint(f"  404 Removed : {totals['TOTAL_404']}", "yellow")
+    cprint(f"  Archived    : {totals['TOTAL_ARCHIVED']}", "cyan")
     cprint(f"  Blocked     : {totals['TOTAL_BLOCKED']}", "yellow")
     cprint(f"  Failed      : {totals['TOTAL_FAILED']}", "red")
     cprint(f"  Unsupported : {totals['TOTAL_UNSUPPORTED']}", "yellow")

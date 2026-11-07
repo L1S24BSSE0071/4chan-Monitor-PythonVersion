@@ -11,6 +11,7 @@ This is a Python rewrite of an earlier Windows batch script (`4chan-threads-moni
 - **Drop-box for new URLs**: paste links into `new_4chan.txt` at any time; they are merged into the main list on the next cycle (duplicates are reported and skipped), then the file is deleted
 - **Pause / resume**: create `pause_4chan.txt` to pause, delete it to resume, no need to stop the script
 - **Smart error handling**: dead threads (404, expired, archived) and unsupported URLs are removed automatically, rate limits trigger a cool-down, and transient failures are retried
+- **Automatic archive fallback**: when a 4chan thread returns 404, the monitor automatically checks matching third-party 4chan archives (`desuarchive.org`, `arch.b4k.co`, `4plebs.org`, `warosu.org`, `palanq.win`, `thebarchive.com`, and `archived.moe`) to recover any remaining posts/media before removing the thread from the active queue
 - **Adaptive pacing**: sleeps shorter when the queue is large and longer when it is small
 - **Atomic file writes**: list and stats files are written via temp file + `os.replace`, so a crash mid-write can't corrupt them
 - **Graceful Ctrl+C**: the first press kills the running `gallery-dl` process and saves stats; the second forces an immediate exit
@@ -61,6 +62,7 @@ Downloads are saved wherever gallery-dl is configured to put them. By default th
 | `--no-clear`        | Don't clear the terminal between cycles (useful for logs and CI)                   |
 | `--no-pause`        | Don't wait for a key press before exiting                                          |
 | `--no-update-check` | Skip the PyPI update check at startup                                              |
+| `--no-archive`      | Skip third-party archive fallback when a 4chan thread returns 404                  |
 | `--self-test`       | Run the built-in sanity checks and exit                                            |
 | `--help`            | Show usage information                                                             |
 
@@ -104,15 +106,15 @@ Each cycle the monitor:
 
 ### Result handling
 
-| What happened                                                              | Action                                                                      |
-| -------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| Exit code 0                                                                | Counted as success                                                          |
-| Deleted individual image (`404`/`410` warning) in an otherwise live thread | Counted as success (partial download)                                       |
-| Output contains `Unsupported URL`                                          | Removed from list                                                           |
-| Output contains thread `404`/`410` `HttpError` or `NotFoundError`          | Removed from list                                                           |
-| Output contains `429`/`403` `HttpError` or `ChallengeError`                | Logged as blocked, pauses 5 minutes, thread stays in the queue              |
-| Any other failure                                                          | Retried up to 3 times (10 s apart), then logged and kept for the next cycle |
-| `gallery-dl` runs longer than 10 minutes                                   | Killed and treated as a failure                                             |
+| What happened                                                              | Action                                                                                                     |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Exit code 0                                                                | Counted as success                                                                                         |
+| Deleted individual image (`404`/`410` warning) in an otherwise live thread | Counted as success (partial download)                                                                      |
+| Output contains `Unsupported URL`                                          | Removed from list                                                                                          |
+| Output contains thread `404`/`410` `HttpError` or `NotFoundError`          | Tries matching 4chan archive mirror(s) once (unless `--no-archive`), then removes thread from active queue |
+| Output contains `429`/`403` `HttpError` or `ChallengeError`                | Logged as blocked, pauses 5 minutes, thread stays in the queue                                             |
+| Any other failure                                                          | Retried up to 3 times (10 s apart), then logged and kept for the next cycle                                |
+| `gallery-dl` runs longer than 10 minutes                                   | Killed and treated as a failure                                                                            |
 
 Removals are logged in `failures_4chan.txt` and automatically cleaned from `threads_4chan.txt` and `priority_4chan.txt`.
 
@@ -128,19 +130,20 @@ Removals are logged in `failures_4chan.txt` and automatically cleaned from `thre
 
 Settings are defined in the frozen `Config` dataclass near the top of the script:
 
-| Setting             | Default | Meaning                                                |
-| ------------------- | ------- | ------------------------------------------------------ |
-| `max_retries`       | `3`     | Retries per thread on a transient failure              |
-| `retry_sleep`       | `10`    | Seconds between retries                                |
-| `base_thread_sleep` | `8`     | Normal pause between threads (s)                       |
-| `min_thread_sleep`  | `3`     | Pause between threads when the queue is 10 or more (s) |
-| `max_thread_sleep`  | `15`    | Pause between threads when the queue is 2 or fewer (s) |
-| `base_cycle_sleep`  | `30`    | Normal pause between cycles (s)                        |
-| `busy_cycle_sleep`  | `15`    | Pause between cycles when the queue is 10 or more (s)  |
-| `idle_cycle_sleep`  | `60`    | Pause between cycles when the queue is 2 or fewer (s)  |
-| `blocked_sleep`     | `300`   | Cool-down after a rate limit or Cloudflare block (s)   |
-| `gallery_timeout`   | `600`   | Maximum runtime for one `gallery-dl` call (s)          |
-| `sleep_request`     | `"2.0"` | Seconds passed to `gallery-dl --sleep-request`         |
+| Setting                | Default | Meaning                                                      |
+| ---------------------- | ------- | ------------------------------------------------------------ |
+| `max_retries`          | `3`     | Retries per thread on a transient failure                    |
+| `retry_sleep`          | `10`    | Seconds between retries                                      |
+| `base_thread_sleep`    | `8`     | Normal pause between threads (s)                             |
+| `min_thread_sleep`     | `3`     | Pause between threads when the queue is 10 or more (s)       |
+| `max_thread_sleep`     | `15`    | Pause between threads when the queue is 2 or fewer (s)       |
+| `base_cycle_sleep`     | `30`    | Normal pause between cycles (s)                              |
+| `busy_cycle_sleep`     | `15`    | Pause between cycles when the queue is 10 or more (s)        |
+| `idle_cycle_sleep`     | `60`    | Pause between cycles when the queue is 2 or fewer (s)        |
+| `blocked_sleep`        | `300`   | Cool-down after a rate limit or Cloudflare block (s)         |
+| `gallery_timeout`      | `600`   | Maximum runtime for one `gallery-dl` call (s)                |
+| `sleep_request`        | `"2.0"` | Seconds passed to `gallery-dl --sleep-request`               |
+| `use_archive_fallback` | `True`  | Check third-party archives once before removing a 404 thread |
 
 File names are configured in the same place.
 
@@ -162,6 +165,7 @@ TOTAL_SESSIONS=0
 TOTAL_CYCLES=0
 TOTAL_SUCCESS=0
 TOTAL_404=0
+TOTAL_ARCHIVED=0
 TOTAL_BLOCKED=0
 TOTAL_FAILED=0
 TOTAL_UNSUPPORTED=0

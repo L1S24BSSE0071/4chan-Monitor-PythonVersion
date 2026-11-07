@@ -11,7 +11,7 @@ This is a Python rewrite of an earlier Windows batch script (`4chan-threads-moni
 - **Drop-box for new URLs**: paste links into `new_4chan.txt` at any time; they are merged into the main list on the next cycle (duplicates are reported and skipped), then the file is deleted
 - **Pause / resume**: create `pause_4chan.txt` to pause, delete it to resume, no need to stop the script
 - **Smart error handling**: dead threads (404, expired, archived) and unsupported URLs are removed automatically, rate limits trigger a cool-down, and transient failures are retried
-- **Automatic archive fallback**: when a 4chan thread returns 404, the monitor automatically checks matching third-party 4chan archives (`desuarchive.org`, `arch.b4k.co`, `4plebs.org`, `warosu.org`, `palanq.win`, `thebarchive.com`, and `archived.moe`) to recover any remaining posts/media before removing the thread from the active queue
+- **Automatic archive fallback**: when a 4chan thread returns 404, the monitor automatically checks matching third-party 4chan archives (`desuarchive.org`, `arch.b4k.co`, `4plebs.org`, `warosu.org`, `archive.palanq.win`, `thebarchive.com`, `archiveofsins.com`, and `archived.moe`) to recover any remaining posts/media before removing the thread from the active queue
 - **Adaptive pacing**: sleeps shorter when the queue is large and longer when it is small
 - **Atomic file writes**: list and stats files are written via temp file + `os.replace`, so a crash mid-write can't corrupt them
 - **Graceful Ctrl+C**: the first press kills the running `gallery-dl` process and saves stats; the second forces an immediate exit

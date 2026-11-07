@@ -45,6 +45,7 @@ class Config:
 CFG = Config()
 
 URL_RE = re.compile(r"^https?://[^\s/]+", re.IGNORECASE)
+WS_RE = re.compile(r"\s+")
 NOT_PRINTABLE_RE = re.compile(r"[^\x20-\x7E]+")
 THREAD_RE = re.compile(r"^https?://boards\.4chan(?:nel)?\.org/([a-z0-9]+)/thread/(\d+)(?:[/?#]|$)", re.IGNORECASE)
 
@@ -56,15 +57,16 @@ ARCHIVE_MAP = {
     "arch.b4k.co": {"v", "vg", "vm", "vmg", "vp", "vrpg", "vst"},
     "4plebs.org": {"adv", "f", "hr", "mlpol", "mo", "o", "pol", "s4s", "sp", "trv", "tv", "x"},
     "warosu.org": {"3", "biz", "cgl", "ck", "diy", "fa", "ic", "jp", "lit", "sci", "vt"},
-    "palanq.win": {"e", "n", "news", "out", "p", "pw", "toy", "vip", "w", "wg", "wsr"},
+    "archive.palanq.win": {"e", "n", "news", "out", "p", "pw", "toy", "vip", "w", "wg", "wsr"},
     "thebarchive.com": {"b", "bant"},
+    "archiveofsins.com": {"h", "hc", "hm", "i", "lgbt", "r", "s", "soc", "t", "u", "y"},
 }
 
 THREAD_GONE_RE = re.compile(
     r"\[(?!(?:downloader\b|download\]))[^\]]+\]\[error\]\s+(?:HttpError:\s*'?(?:404|410)\b|NotFoundError:)",
     re.I,
 )
-BLOCKED_RE = re.compile(r"\]\[(?:error|warning)\]\s+(?:HttpError:\s*'?(?:429|403)\b|ChallengeError:)", re.I)
+BLOCKED_RE = re.compile(r"\]\[(?:error|warning)\]\s+(?:(?:HttpError:\s*)?'?(?:429|403)\b|ChallengeError:)", re.I)
 UNSUPPORTED_RE = re.compile(r"\]\[error\]\s+Unsupported URL", re.I)
 ERROR_LINE_RE = re.compile(r"\]\[error\]", re.I)
 FAILED_DL_RE = re.compile(r"\]\[error\]\s+Failed to download", re.I)
@@ -216,14 +218,20 @@ def archive_urls_for(url: str) -> List[str]:
     return urls
 
 
+def _extract_url(line: str) -> Optional[str]:
+    tokens = NOT_PRINTABLE_RE.sub("", WS_RE.sub(" ", line)).split("#", 1)[0].replace('"', " ").replace("'", " ").split()
+    if tokens and URL_RE.match(tokens[0]):
+        return tokens[0]
+    return None
+
+
 def parse_urls(text: str) -> List[str]:
     seen: Set[str] = set()
     out: List[str] = []
     for line in text.splitlines():
-        tokens = NOT_PRINTABLE_RE.sub("", line).split("#", 1)[0].replace('"', " ").replace("'", " ").split()
-        if not tokens or not URL_RE.match(tokens[0]):
+        cleaned = _extract_url(line)
+        if not cleaned:
             continue
-        cleaned = tokens[0]
         key = dedupe_key(cleaned)
         if key not in seen:
             seen.add(key)
@@ -352,7 +360,10 @@ def absorb_new_box() -> int:
     added: List[str] = []
     events: List[tuple] = []
     dupes = 0
-    for url in parse_urls(raw.decode("utf-8", errors="ignore")):
+    for line in raw.decode("utf-8", errors="ignore").splitlines():
+        url = _extract_url(line)
+        if not url:
+            continue
         key = dedupe_key(url)
         if key in known:
             events.append((f"  [DUPLICATE] {url}", "yellow"))
@@ -495,10 +506,10 @@ def classify(res: RunResult) -> str:
         return "unsupported"
     if THREAD_GONE_RE.search(err):
         return "dead"
-    if BLOCKED_RE.search(err):
-        return "blocked"
     if res.code == 0:
         return "partial" if FILE_GONE_RE.search(err) else "ok"
+    if BLOCKED_RE.search(err):
+        return "blocked"
     failed = len(FAILED_DL_RE.findall(err))
     dl_404_errs = len(DL_404_ERR_RE.findall(err))
     other_errors = len(ERROR_LINE_RE.findall(err)) - failed - dl_404_errs
@@ -543,7 +554,8 @@ def try_archive_fallback(url: str, counters: Dict[str, int]) -> Optional[bool]:
             return None
         if res.timed_out:
             continue
-        if classify(res) in ("ok", "partial"):
+        kind = classify(res)
+        if kind == "ok" or (kind == "partial" and bool(res.out.strip())):
             cprint("  [ARCHIVE OK] Recovered from archive, removing from active list", "green")
             log_failure(f"404 ARCHIVED ({arch_url}): {url}")
             counters.setdefault("CYCLE_ARCHIVED", 0)
@@ -631,12 +643,8 @@ def process_thread(
                 print()
                 return True
             wait = CFG.blocked_sleep
-            cprint(
-                f"  [BLOCKED] Rate-limited, pausing {wait}s"
-                if wait < 60
-                else f"  [BLOCKED] Rate-limited, pausing {wait // 60}m",
-                "red",
-            )
+            wait_str = f"{wait // 60}m" if wait >= 60 and wait % 60 == 0 else f"{wait}s"
+            cprint(f"  [BLOCKED] Rate-limited, pausing {wait_str}", "red")
             print()
             return not interruptible_sleep(wait)
         if attempt == CFG.max_retries:
@@ -670,14 +678,20 @@ def run_self_test() -> int:
         "\ufeffhttps://boards.4chan.org/g/thread/123#p9\n"
         "https://boards.4channel.org/g/thread/123/some-slug\n"
         '\ufeff   " https://boards.4chan.org/a/thread/5 "   # anime\n'
+        "https://boards.4chan.org/v/thread/77\tinline-tab-note\n"
         "https://\n"
         "not a url\n\n"
     )
     cases = [
         ("missing file -> []", read_urls(Path("nonexistent-file")) == []),
         (
-            "parse: dedupe + BOM + quotes + fragments + comments",
-            parse_urls(text) == ["https://boards.4chan.org/g/thread/123", "https://boards.4chan.org/a/thread/5"],
+            "parse: dedupe + BOM + quotes + tabs + fragments + comments",
+            parse_urls(text)
+            == [
+                "https://boards.4chan.org/g/thread/123",
+                "https://boards.4chan.org/a/thread/5",
+                "https://boards.4chan.org/v/thread/77",
+            ],
         ),
         (
             "healthy thread whose filenames contain 404/429/403 stays alive",
@@ -685,6 +699,14 @@ def run_self_test() -> int:
         ),
         ("thread 404", classify(RunResult(4, err=dead_err)) == "dead"),
         ("429", classify(RunResult(4, err="[4chan][error] HttpError: '429 Too Many Requests' for 'u'")) == "blocked"),
+        (
+            "downloader 429 failure is blocked",
+            classify(RunResult(4, err="[downloader.http][warning] '429 Too Many Requests' for 'u'\n[download][error] Failed to download 1.jpg")) == "blocked",
+        ),
+        (
+            "recovered 429 warning with exit code 0 is ok",
+            classify(RunResult(0, err="[downloader.http][warning] '429 Too Many Requests' for 'u' (1/5)\n")) == "ok",
+        ),
         (
             "cloudflare",
             classify(RunResult(8, err="[4chan][error] ChallengeError: cloudflare (403 Forbidden) for 'u'")) == "blocked",
@@ -699,7 +721,9 @@ def run_self_test() -> int:
         (
             "archive fallback URL generation",
             archive_urls_for("https://boards.4chan.org/g/thread/123/slug")
-            == ["https://desuarchive.org/g/thread/123", "https://archived.moe/g/thread/123"],
+            == ["https://desuarchive.org/g/thread/123", "https://archived.moe/g/thread/123"]
+            and archive_urls_for("https://boards.4chan.org/wg/thread/99")
+            == ["https://archive.palanq.win/wg/thread/99", "https://archived.moe/wg/thread/99"],
         ),
     ]
     failed = [name for name, ok in cases if not ok]
@@ -783,8 +807,9 @@ def main() -> None:
 
     with contextlib.suppress(ValueError, OSError):
         signal.signal(signal.SIGINT, on_signal)
-        if hasattr(signal, "SIGBREAK"):
-            signal.signal(signal.SIGBREAK, on_signal)
+        for sig_name in ("SIGBREAK", "SIGTERM"):
+            if hasattr(signal, sig_name):
+                signal.signal(getattr(signal, sig_name), on_signal)
 
     current_loop = 0
 
@@ -880,7 +905,9 @@ def main() -> None:
             if is_last_cycle:
                 cprint("[SYSTEM] Max cycles reached. Exiting.", "cyan")
                 break
-            if max_loops > 0 and removed_count >= queue_size and not CFG.new_box.exists():
+            if max_loops > 0 and removed_count > 0 and not (
+                read_urls(CFG.list_file) or read_urls(CFG.priority_box) or CFG.new_box.exists()
+            ):
                 cprint("[WAIT] No threads remaining in queue. Exiting.", "yellow")
                 break
             cprint(f"[SYSTEM] Resting {cycle_sleep}s...", "white")

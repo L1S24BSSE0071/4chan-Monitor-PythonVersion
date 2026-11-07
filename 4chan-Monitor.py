@@ -252,9 +252,15 @@ def parse_urls(text: str) -> List[str]:
     return out
 
 
+def _decode_bytes(raw: bytes) -> str:
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="ignore")
+    return raw.decode("utf-8-sig", errors="ignore")
+
+
 def read_urls(path: Path) -> Optional[List[str]]:
     try:
-        return parse_urls(path.read_text(encoding="utf-8", errors="ignore"))
+        return parse_urls(_decode_bytes(path.read_bytes()))
     except FileNotFoundError:
         return []
     except OSError:
@@ -309,6 +315,10 @@ def check_pypi_update(ver_raw: str) -> None:
 
 def sanitize_list() -> None:
     cleanup_stale_temp()
+    if CFG.priority_box.exists():
+        prio_urls = read_urls(CFG.priority_box)
+        if prio_urls is not None:
+            safe_write(CFG.priority_box, "\n".join(prio_urls) + ("\n" if prio_urls else ""))
     if not CFG.list_file.exists():
         return
     urls = read_urls(CFG.list_file)
@@ -343,7 +353,7 @@ COUNTER_MAP = {
 def load_stats() -> Dict[str, int]:
     stats = DEFAULT_STATS.copy()
     try:
-        lines = CFG.stats_file.read_text(encoding="utf-8-sig", errors="ignore").splitlines()
+        lines = _decode_bytes(CFG.stats_file.read_bytes()).splitlines()
     except OSError:
         return stats
     for line in lines:
@@ -373,7 +383,7 @@ def absorb_new_box() -> int:
     added: List[str] = []
     events: List[tuple] = []
     dupes = 0
-    for line in raw.decode("utf-8", errors="ignore").splitlines():
+    for line in _decode_bytes(raw).splitlines():
         url = _extract_url(line)
         if not url:
             continue
@@ -540,7 +550,9 @@ def last_error_line(err: str) -> str:
         if FAILED_DL_RE.search(last_err):
             warns = [ln for ln in all_lines if DL_WARN_RE.search(ln)]
             if warns:
-                return f"{warns[-1]} -> {last_err}"[:200]
+                non_404 = [ln for ln in warns if not DL_404_WARN_RE.search(ln)]
+                chosen = non_404[-1] if non_404 else warns[-1]
+                return f"{chosen} -> {last_err}"[:200]
         return last_err[:200]
     return all_lines[-1][:200] if all_lines else ""
 

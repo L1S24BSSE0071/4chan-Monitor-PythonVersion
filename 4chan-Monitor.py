@@ -18,8 +18,7 @@ from typing import Dict, List, Optional, Set
 
 VERSION = "V 1.0"
 
-# Persistent file locations used by the monitor. These are intentionally simple
-# names so the script can run from a directory containing its working files.
+
 @dataclass(frozen=True)
 class Config:
     list_file: Path = Path("threads_4chan.txt")
@@ -41,9 +40,10 @@ class Config:
     retry_sleep: int = 10
     sleep_request: str = "2.0"
 
+
 CFG = Config()
 
-URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+URL_RE = re.compile(r"^https?://[^\s/]+", re.IGNORECASE)
 NOT_PRINTABLE_RE = re.compile(r"[^\x20-\x7E]+")
 THREAD_RE = re.compile(r"^https?://boards\.4chan(?:nel)?\.org/([a-z0-9]+)/thread/(\d+)", re.IGNORECASE)
 
@@ -52,14 +52,21 @@ BLOCKED_RE = re.compile(r"\]\[error\]\s+(?:HttpError:\s*'?(?:429|403)\b|Challeng
 UNSUPPORTED_RE = re.compile(r"\]\[error\]\s+Unsupported URL", re.I)
 ERROR_LINE_RE = re.compile(r"\]\[error\]", re.I)
 FAILED_DL_RE = re.compile(r"\]\[error\]\s+Failed to download", re.I)
-FILE_GONE_RE = re.compile(r"\]\[warning\]\s+'?(?:404|410)\b", re.I)
+FILE_GONE_RE = re.compile(r"\]\[warning\]\s+(?:HttpError:\s*)?'?(?:404|410)\b", re.I)
 
-COLORS = {"cyan": "\033[96m", "green": "\033[92m", "yellow": "\033[93m", "red": "\033[91m", "white": "\033[97m", "gray": "\033[90m", "reset": "\033[0m"}
+COLORS = {
+    "cyan": "\033[96m",
+    "green": "\033[92m",
+    "yellow": "\033[93m",
+    "red": "\033[91m",
+    "white": "\033[97m",
+    "gray": "\033[90m",
+    "reset": "\033[0m",
+}
 IS_TTY = sys.stdout.isatty()
 SPINNER = "|/-\\"
 
-# ANSI colors are only enabled when stdout is a TTY and the terminal supports
-# them. This keeps logs readable in terminals while avoiding escape codes in logs.
+
 def _enable_ansi() -> bool:
     if os.environ.get("NO_COLOR") or not IS_TTY:
         return False
@@ -76,7 +83,9 @@ def _enable_ansi() -> bool:
             return False
     return True
 
+
 USE_COLOR = _enable_ansi()
+
 
 def cprint(msg: str = "", color: str = "white") -> None:
     if USE_COLOR:
@@ -84,19 +93,20 @@ def cprint(msg: str = "", color: str = "white") -> None:
     sys.stdout.write(msg + "\n")
     sys.stdout.flush()
 
-# Wait for a keypress before exit when running interactively. This gives the
-# user a chance to read the final session summary.
+
 def press_any_key_to_exit() -> None:
     cprint("Press any key to exit...", "white")
-    try:
-        import msvcrt
-        msvcrt.getch()
-    except ImportError:
-        with contextlib.suppress(EOFError, OSError):
+    with contextlib.suppress(EOFError, OSError, KeyboardInterrupt):
+        try:
+            import msvcrt
+            msvcrt.getch()
+        except ImportError:
             input()
+
 
 stop_event = threading.Event()
 current_proc: Optional[subprocess.Popen] = None
+
 
 def interruptible_sleep(seconds: float) -> bool:
     end = time.monotonic() + seconds
@@ -106,20 +116,26 @@ def interruptible_sleep(seconds: float) -> bool:
         time.sleep(min(0.2, max(0.0, end - time.monotonic())))
     return stop_event.is_set()
 
+
 def kill_tree(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
         return
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=True,
+            )
         else:
             os.killpg(proc.pid, signal.SIGKILL)
     except (OSError, subprocess.SubprocessError):
         with contextlib.suppress(OSError):
             proc.kill()
 
-# Write a file via a temp file + atomic replace so a crash or interruption does
-# not leave a partially-written queue/log file behind.
+
 def atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
@@ -141,6 +157,7 @@ def atomic_write(path: Path, content: str) -> None:
             os.unlink(tmp)
         raise
 
+
 def safe_write(path: Path, content: str) -> bool:
     try:
         atomic_write(path, content)
@@ -149,10 +166,13 @@ def safe_write(path: Path, content: str) -> bool:
         cprint(f"[WARN] Could not write {path}: {e}", "yellow")
         return False
 
+
 def cleanup_stale_temp() -> None:
-    for p in Path(".").glob(".*_4chan.txt.*.tmp"):
+    err_file = CFG.log_file.with_name(CFG.log_file.name + ".err")
+    for p in (*Path(".").glob(".*_4chan.txt.*.tmp"), err_file):
         with contextlib.suppress(OSError):
             p.unlink()
+
 
 def dedupe_key(url: str) -> str:
     m = THREAD_RE.match(url)
@@ -160,23 +180,21 @@ def dedupe_key(url: str) -> str:
         return f"{m.group(1).lower()}/{m.group(2)}"
     return url.split("#", 1)[0].rstrip("/").lower()
 
-# Convert raw text into a list of normalized thread URLs. Duplicate URLs are
-# removed by board/thread key so the queue stays deduplicated.
+
 def parse_urls(text: str) -> List[str]:
     seen: Set[str] = set()
     out: List[str] = []
     for line in text.splitlines():
-        tokens = line.split()
-        if not tokens:
+        tokens = NOT_PRINTABLE_RE.sub("", line).split("#", 1)[0].split()
+        if not tokens or not URL_RE.match(tokens[0]):
             continue
-        cleaned = NOT_PRINTABLE_RE.sub("", tokens[0]).split("#", 1)[0]
-        if not URL_RE.match(cleaned):
-            continue
+        cleaned = tokens[0]
         key = dedupe_key(cleaned)
         if key not in seen:
             seen.add(key)
             out.append(cleaned)
     return out
+
 
 def read_urls(path: Path) -> Optional[List[str]]:
     try:
@@ -186,29 +204,40 @@ def read_urls(path: Path) -> Optional[List[str]]:
     except OSError:
         return None
 
+
 def check_gallery_dl() -> str:
     cprint("[STARTUP] Checking gallery-dl...", "white")
     if not shutil.which("gallery-dl"):
         cprint("[FATAL] gallery-dl not found in PATH. Install with: pip install gallery-dl", "red")
         sys.exit(1)
     try:
-        r = subprocess.run(["gallery-dl", "--version"], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+        r = subprocess.run(
+            ["gallery-dl", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
         ver = (r.stdout or r.stderr or "").strip()
-        if not ver:
-            raise RuntimeError("empty version output")
+        if r.returncode != 0 or not ver:
+            raise RuntimeError(ver or f"exit code {r.returncode}")
+        ver = ver.splitlines()[0].strip()
         cprint(f"[STARTUP] Found: {ver}", "green")
         return ver
     except Exception as e:
         cprint(f"[FATAL] gallery-dl check failed: {e}", "red")
         sys.exit(1)
 
+
 def _version_tuple(v: str) -> tuple:
     return tuple(int(x) for x in re.findall(r"\d+", v.split("-")[0])[:4])
+
 
 def check_pypi_update(ver_raw: str) -> None:
     ver = re.sub(r"^gallery-dl\s*", "", ver_raw.strip(), flags=re.I)
     try:
-        import json, urllib.request
+        import json
+        import urllib.request
         req = urllib.request.Request("https://pypi.org/pypi/gallery-dl/json", headers={"User-Agent": "4chan-monitor/1.1"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             latest = json.loads(resp.read().decode())["info"]["version"]
@@ -219,6 +248,7 @@ def check_pypi_update(ver_raw: str) -> None:
     except Exception:
         cprint("[STARTUP] Update check skipped (offline)", "gray")
     print()
+
 
 def sanitize_list() -> None:
     cleanup_stale_temp()
@@ -232,8 +262,24 @@ def sanitize_list() -> None:
         cprint(f"[STARTUP] List sanitized: {len(urls)} URLs", "green")
         print()
 
-DEFAULT_STATS = {"TOTAL_SESSIONS": 0, "TOTAL_CYCLES": 0, "TOTAL_SUCCESS": 0, "TOTAL_404": 0, "TOTAL_BLOCKED": 0, "TOTAL_FAILED": 0, "TOTAL_UNSUPPORTED": 0}
-COUNTER_MAP = {"TOTAL_SUCCESS": "CYCLE_SUCCESS", "TOTAL_404": "CYCLE_404", "TOTAL_BLOCKED": "CYCLE_BLOCKED", "TOTAL_FAILED": "CYCLE_FAILED", "TOTAL_UNSUPPORTED": "CYCLE_UNSUPPORTED"}
+
+DEFAULT_STATS = {
+    "TOTAL_SESSIONS": 0,
+    "TOTAL_CYCLES": 0,
+    "TOTAL_SUCCESS": 0,
+    "TOTAL_404": 0,
+    "TOTAL_BLOCKED": 0,
+    "TOTAL_FAILED": 0,
+    "TOTAL_UNSUPPORTED": 0,
+}
+COUNTER_MAP = {
+    "TOTAL_SUCCESS": "CYCLE_SUCCESS",
+    "TOTAL_404": "CYCLE_404",
+    "TOTAL_BLOCKED": "CYCLE_BLOCKED",
+    "TOTAL_FAILED": "CYCLE_FAILED",
+    "TOTAL_UNSUPPORTED": "CYCLE_UNSUPPORTED",
+}
+
 
 def load_stats() -> Dict[str, int]:
     stats = DEFAULT_STATS.copy()
@@ -249,8 +295,10 @@ def load_stats() -> Dict[str, int]:
                 stats[k] = int(v.strip())
     return stats
 
+
 def save_stats(stats: Dict[str, int]) -> None:
     safe_write(CFG.stats_file, "\n".join(f"{k}={v}" for k, v in stats.items()) + "\n")
+
 
 def absorb_new_box() -> int:
     if not CFG.new_box.exists():
@@ -284,6 +332,7 @@ def absorb_new_box() -> int:
             CFG.new_box.unlink()
     return len(added)
 
+
 def wait_if_paused() -> None:
     if not CFG.pause_file.exists():
         return
@@ -294,22 +343,23 @@ def wait_if_paused() -> None:
     cprint("[RESUMED]", "green")
     print()
 
+
 def remove_dead(dead_urls: List[str]) -> int:
     dead_keys = {dedupe_key(u) for u in dead_urls if URL_RE.match(u)}
     if not dead_keys:
         return 0
-    total_removed = 0
+    removed_keys: Set[str] = set()
     for path in (CFG.list_file, CFG.priority_box):
         current = read_urls(path)
         if not current:
             continue
         kept = [u for u in current if dedupe_key(u) not in dead_keys]
-        removed = len(current) - len(kept)
-        if removed and safe_write(path, "\n".join(kept) + ("\n" if kept else "")):
-            total_removed += removed
-    if total_removed:
-        cprint(f"[CLEANUP] Removed {total_removed} dead threads from list", "yellow")
-    return total_removed
+        if len(kept) < len(current) and safe_write(path, "\n".join(kept) + ("\n" if kept else "")):
+            removed_keys.update(dedupe_key(u) for u in current if dedupe_key(u) in dead_keys)
+    if removed_keys:
+        cprint(f"[CLEANUP] Removed {len(removed_keys)} dead threads from list", "yellow")
+    return len(removed_keys)
+
 
 @dataclass
 class RunResult:
@@ -319,13 +369,24 @@ class RunResult:
     interrupted: bool = False
     timed_out: bool = False
 
+
+def _clear_spinner() -> None:
+    if IS_TTY:
+        sys.stdout.write("\r" + " " * 60 + "\r")
+        sys.stdout.flush()
+
+
 def run_gallery_dl(url: str) -> RunResult:
     global current_proc
     if stop_event.is_set():
         return RunResult(-1, interrupted=True)
     err_path = CFG.log_file.with_name(CFG.log_file.name + ".err")
     cmd = ["gallery-dl", "--sleep-request", CFG.sleep_request, url]
-    popen_kw = ({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {"start_new_session": True})
+    popen_kw = (
+        {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+        if os.name == "nt"
+        else {"start_new_session": True}
+    )
     start = time.monotonic()
     timed_out = False
     code = 1
@@ -341,13 +402,13 @@ def run_gallery_dl(url: str) -> RunResult:
                 except subprocess.TimeoutExpired:
                     pass
                 if stop_event.is_set():
-                    cprint("\n  [INTERRUPTED] Stopping gallery-dl", "yellow")
+                    _clear_spinner()
+                    cprint("  [INTERRUPTED] Stopping gallery-dl", "yellow")
                     kill_tree(proc)
                     break
                 elapsed = int(time.monotonic() - start)
                 if elapsed >= CFG.gallery_timeout:
-                    if IS_TTY:
-                        sys.stdout.write("\r" + " " * 60 + "\r")
+                    _clear_spinner()
                     cprint(f"  [TIMEOUT] {CFG.gallery_timeout}s exceeded, killing process", "red")
                     timed_out = True
                     kill_tree(proc)
@@ -359,9 +420,7 @@ def run_gallery_dl(url: str) -> RunResult:
                     spin += 1
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5)
-            if IS_TTY:
-                sys.stdout.write("\r" + " " * 60 + "\r")
-                sys.stdout.flush()
+            _clear_spinner()
             code = proc.returncode if proc.returncode is not None else 1
     except FileNotFoundError:
         cprint("  [FATAL] gallery-dl not found", "red")
@@ -373,22 +432,22 @@ def run_gallery_dl(url: str) -> RunResult:
         return RunResult(1)
     finally:
         current_proc = None
-    if stop_event.is_set():
-        return RunResult(-1, interrupted=True)
-    try:
-        out_bytes = CFG.log_file.read_bytes()
-        err_bytes = err_path.read_bytes()
-        if err_bytes:
-            with CFG.log_file.open("ab") as f:
-                f.write(err_bytes)
+        out_bytes = b""
+        err_bytes = b""
+        with contextlib.suppress(OSError):
+            out_bytes = CFG.log_file.read_bytes()
+        with contextlib.suppress(OSError):
+            err_bytes = err_path.read_bytes()
+            if err_bytes:
+                with CFG.log_file.open("ab") as f:
+                    f.write(err_bytes)
         with contextlib.suppress(OSError):
             err_path.unlink()
-        return RunResult(code, out_bytes.decode("utf-8", "ignore"), err_bytes.decode("utf-8", "ignore"), timed_out=timed_out)
-    except OSError:
-        return RunResult(code, timed_out=timed_out)
+    if stop_event.is_set():
+        return RunResult(-1, interrupted=True)
+    return RunResult(code, out_bytes.decode("utf-8", "ignore"), err_bytes.decode("utf-8", "ignore"), timed_out=timed_out)
 
-# Decide whether a gallery-dl run succeeded, hit a dead thread, was blocked, or
-# needs to be retried. This classification drives the queue logic.
+
 def classify(res: RunResult) -> str:
     err = res.err
     if UNSUPPORTED_RE.search(err):
@@ -398,16 +457,18 @@ def classify(res: RunResult) -> str:
     if BLOCKED_RE.search(err):
         return "blocked"
     if res.code == 0:
-        return "ok"
+        return "partial" if FILE_GONE_RE.search(err) else "ok"
     failed = len(FAILED_DL_RE.findall(err))
     other_errors = len(ERROR_LINE_RE.findall(err)) - failed
     if failed and other_errors == 0 and len(FILE_GONE_RE.findall(err)) >= failed:
         return "partial"
     return "error"
 
+
 def last_error_line(err: str) -> str:
     lines = [ln.strip() for ln in err.splitlines() if ERROR_LINE_RE.search(ln)]
     return lines[-1][:200] if lines else ""
+
 
 def log_failure(msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -415,9 +476,15 @@ def log_failure(msg: str) -> None:
         with CFG.fail_log.open("a", encoding="utf-8", newline="\n") as f:
             f.write(f"[{ts}] {msg}\n")
 
-# Process one queue item. Returns True when the loop should continue to the next
-# job, False when the monitor should stop cleanly.
-def process_thread(url: str, label: str, dry_run: bool, counters: Dict[str, int], dead_list: List[str], thread_sleep: int) -> bool:
+
+def process_thread(
+    url: str,
+    label: str,
+    dry_run: bool,
+    counters: Dict[str, int],
+    dead_list: List[str],
+    thread_sleep: int,
+) -> bool:
     wait_if_paused()
     if stop_event.is_set():
         return False
@@ -468,7 +535,12 @@ def process_thread(url: str, label: str, dry_run: bool, counters: Dict[str, int]
         if kind == "blocked":
             log_failure(f"BLOCKED: {url}")
             wait = CFG.blocked_sleep
-            cprint(f"  [BLOCKED] Rate-limited, pausing {wait}s" if wait < 60 else f"  [BLOCKED] Rate-limited, pausing {wait // 60}m", "red")
+            cprint(
+                f"  [BLOCKED] Rate-limited, pausing {wait}s"
+                if wait < 60
+                else f"  [BLOCKED] Rate-limited, pausing {wait // 60}m",
+                "red",
+            )
             print()
             counters["CYCLE_BLOCKED"] += 1
             return not interruptible_sleep(wait)
@@ -481,17 +553,36 @@ def process_thread(url: str, label: str, dry_run: bool, counters: Dict[str, int]
             return True
     return True
 
+
 def run_self_test() -> int:
     dead_err = "[4chan][error] HttpError: '404 Not Found' for 'https://a.4cdn.org/g/thread/2.json'\n"
-    file_gone = ("[downloader.http][warning] '404 Not Found' for 'https://i.4cdn.org/g/9.jpg'\n" "[download][error] Failed to download 9.jpg\n")
-    text = ("\ufeffhttps://boards.4chan.org/g/thread/123#p9\n" "https://boards.4channel.org/g/thread/123/some-slug\n" "https://boards.4chan.org/a/thread/5   # anime\n" "not a url\n\n")
+    file_gone = (
+        "[downloader.http][warning] '404 Not Found' for 'https://i.4cdn.org/g/9.jpg'\n"
+        "[download][error] Failed to download 9.jpg\n"
+    )
+    text = (
+        "\ufeffhttps://boards.4chan.org/g/thread/123#p9\n"
+        "https://boards.4channel.org/g/thread/123/some-slug\n"
+        "\ufeff   https://boards.4chan.org/a/thread/5   # anime\n"
+        "https://\n"
+        "not a url\n\n"
+    )
     cases = [
         ("missing file -> []", read_urls(Path("nonexistent-file")) == []),
-        ("parse: dedupe + BOM + fragments + comments", parse_urls(text) == ["https://boards.4chan.org/g/thread/123", "https://boards.4chan.org/a/thread/5"]),
-        ("healthy thread whose filenames contain 404/429/403 stays alive", classify(RunResult(0, out="./gallery-dl/4chan/g/1/1700004041404.jpg\n./x/1429403.png\n")) == "ok"),
+        (
+            "parse: dedupe + BOM + fragments + comments",
+            parse_urls(text) == ["https://boards.4chan.org/g/thread/123", "https://boards.4chan.org/a/thread/5"],
+        ),
+        (
+            "healthy thread whose filenames contain 404/429/403 stays alive",
+            classify(RunResult(0, out="./gallery-dl/4chan/g/1/1700004041404.jpg\n./x/1429403.png\n")) == "ok",
+        ),
         ("thread 404", classify(RunResult(4, err=dead_err)) == "dead"),
         ("429", classify(RunResult(4, err="[4chan][error] HttpError: '429 Too Many Requests' for 'u'")) == "blocked"),
-        ("cloudflare", classify(RunResult(8, err="[4chan][error] ChallengeError: cloudflare (403 Forbidden) for 'u'")) == "blocked"),
+        (
+            "cloudflare",
+            classify(RunResult(8, err="[4chan][error] ChallengeError: cloudflare (403 Forbidden) for 'u'")) == "blocked",
+        ),
         ("unsupported", classify(RunResult(64, err="[gallery-dl][error] Unsupported URL 'https://x.y/z'")) == "unsupported"),
         ("deleted image in live thread is not a dead thread", classify(RunResult(4, err=file_gone)) == "partial"),
         ("network error is retried", classify(RunResult(4, err="[4chan][error] ConnectionError: boom")) == "error"),
@@ -505,9 +596,9 @@ def run_self_test() -> int:
     cprint("Self-test passed!", "green")
     return 0
 
+
 def main() -> None:
-    # Parse CLI flags such as dry-run mode, loop count, and startup options.
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description="Monitor and download 4chan threads using gallery-dl.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be downloaded without downloading")
     parser.add_argument("--loops", type=int, default=None, help="Number of cycles (0 = infinite)")
     parser.add_argument("--no-clear", action="store_true", help="Don't clear screen between cycles")
@@ -536,20 +627,13 @@ def main() -> None:
     if args.dry_run:
         cprint("[DRY-RUN MODE] No files will be downloaded", "yellow")
         print()
-
-    # In dry-run we don't need gallery-dl - allow testing without it
-    if args.dry_run:
-        ver = "dry-run (gallery-dl check skipped)"
-        cprint(f"[STARTUP] {ver}", "gray")
+        cprint("[STARTUP] dry-run (gallery-dl check skipped)", "gray")
         print()
     else:
         ver = check_gallery_dl()
         if not args.no_update_check:
             check_pypi_update(ver)
     sanitize_list()
-
-    totals = load_stats()
-    totals["TOTAL_SESSIONS"] += 1
 
     if args.loops is not None:
         max_loops = max(0, args.loops)
@@ -560,15 +644,14 @@ def main() -> None:
         except (ValueError, EOFError):
             max_loops = 0
         except KeyboardInterrupt:
-            # Ctrl+C at prompt should exit cleanly, not traceback
-            print()  # newline after ^C
+            print()
             cprint("[EXIT] Interrupted at prompt, exiting.", "yellow")
-            if sys.stdin.isatty() and not args.no_pause:
-                press_any_key_to_exit()
             sys.exit(0)
+        clear_screen()
 
-    # Ctrl+C should stop the monitor gracefully; if a second interrupt arrives,
-    # force-kill the active gallery-dl subprocess.
+    totals = load_stats()
+    totals["TOTAL_SESSIONS"] += 1
+
     def on_signal(signum, frame):
         if stop_event.is_set():
             cprint("\n[FORCE EXIT] Terminating...", "red")
@@ -585,31 +668,33 @@ def main() -> None:
             signal.signal(signal.SIGBREAK, on_signal)
 
     current_loop = 0
-    clear_screen()
 
     try:
-        # Main monitoring loop: keep reading the queue, downloading threads, and
-        # sleeping between cycles while respecting pause/interrupt state.
         while not stop_event.is_set():
             wait_if_paused()
             if stop_event.is_set():
                 break
             absorb_new_box()
-            if not CFG.list_file.exists() and not CFG.priority_box.exists():
-                cprint(f"[WAIT] No thread list found ({CFG.list_file}). Waiting 60s...", "yellow")
-                if interruptible_sleep(60):
-                    break
-                clear_screen()
-                continue
             queue_urls = read_urls(CFG.list_file)
             prio_urls = read_urls(CFG.priority_box)
             if queue_urls is None or prio_urls is None:
                 cprint("[WARN] Thread list is locked/unreadable, retrying in 10s", "yellow")
-                if interruptible_sleep(10):
+                if args.dry_run or interruptible_sleep(10):
                     break
                 continue
             prio_keys = {dedupe_key(u) for u in prio_urls}
-            jobs = ([("PRIORITY", u) for u in prio_urls] + [("NORMAL", u) for u in queue_urls if dedupe_key(u) not in prio_keys])
+            jobs = [("PRIORITY", u) for u in prio_urls] + [
+                ("NORMAL", u) for u in queue_urls if dedupe_key(u) not in prio_keys
+            ]
+            if not jobs:
+                if args.dry_run:
+                    cprint(f"[WAIT] No threads queued ({CFG.list_file}).", "yellow")
+                    break
+                cprint(f"[WAIT] No threads queued ({CFG.list_file}). Waiting 60s...", "yellow")
+                if interruptible_sleep(60):
+                    break
+                clear_screen()
+                continue
             queue_size = len(jobs)
             current_loop += 1
             totals["TOTAL_CYCLES"] += 1
@@ -620,12 +705,22 @@ def main() -> None:
             elif queue_size >= 10:
                 thread_sleep, cycle_sleep = CFG.min_thread_sleep, CFG.busy_cycle_sleep
             cprint("=" * 79, "cyan")
-            cprint(f" CYCLE: {current_loop} | TIME: {datetime.now().strftime('%H:%M:%S')} | QUEUE: {queue_size} | SLEEP: {thread_sleep}s", "cyan")
+            cprint(
+                f" CYCLE: {current_loop} | TIME: {datetime.now().strftime('%H:%M:%S')} | QUEUE: {queue_size} | SLEEP: {thread_sleep}s",
+                "cyan",
+            )
             if args.dry_run:
                 cprint(" MODE: DRY-RUN", "yellow")
             cprint("=" * 79, "cyan")
             print()
-            counters = {"CYCLE_SUCCESS": 0, "CYCLE_404": 0, "CYCLE_BLOCKED": 0, "CYCLE_FAILED": 0, "CYCLE_SKIPPED": 0, "CYCLE_UNSUPPORTED": 0}
+            counters = {
+                "CYCLE_SUCCESS": 0,
+                "CYCLE_404": 0,
+                "CYCLE_BLOCKED": 0,
+                "CYCLE_FAILED": 0,
+                "CYCLE_SKIPPED": 0,
+                "CYCLE_UNSUPPORTED": 0,
+            }
             dead_accum: List[str] = []
             for label, url in jobs:
                 if not process_thread(url, label, args.dry_run, counters, dead_accum, thread_sleep):
@@ -634,7 +729,8 @@ def main() -> None:
                 remove_dead(dead_accum)
             for total_key, cycle_key in COUNTER_MAP.items():
                 totals[total_key] += counters[cycle_key]
-            save_stats(totals)
+            if not args.dry_run:
+                save_stats(totals)
             if stop_event.is_set():
                 cprint("\n[INTERRUPTED] Stats saved, exiting...", "yellow")
                 break
@@ -649,7 +745,10 @@ def main() -> None:
             cprint(f"  Failed      : {counters['CYCLE_FAILED']}", "red")
             cprint(f"  Skipped     : {counters['CYCLE_SKIPPED']}", "gray")
             cprint("-" * 71, "cyan")
-            cprint(f" ALL-TIME  Cycles:{totals['TOTAL_CYCLES']}  OK:{totals['TOTAL_SUCCESS']}  404:{totals['TOTAL_404']}  Blocked:{totals['TOTAL_BLOCKED']}  Failed:{totals['TOTAL_FAILED']}  Unsupported:{totals['TOTAL_UNSUPPORTED']}", "white")
+            cprint(
+                f" ALL-TIME  Cycles:{totals['TOTAL_CYCLES']}  OK:{totals['TOTAL_SUCCESS']}  404:{totals['TOTAL_404']}  Blocked:{totals['TOTAL_BLOCKED']}  Failed:{totals['TOTAL_FAILED']}  Unsupported:{totals['TOTAL_UNSUPPORTED']}",
+                "white",
+            )
             cprint("-" * 71, "cyan")
             print()
             if max_loops > 0 and current_loop >= max_loops:
@@ -663,7 +762,8 @@ def main() -> None:
         cprint("\n[INTERRUPTED] Saving...", "yellow")
         stop_event.set()
     finally:
-        save_stats(totals)
+        if not args.dry_run:
+            save_stats(totals)
         proc = current_proc
         if proc is not None:
             kill_tree(proc)
@@ -679,9 +779,9 @@ def main() -> None:
     cprint(f"  Unsupported : {totals['TOTAL_UNSUPPORTED']}", "yellow")
     cprint("=" * 79, "cyan")
     print()
-    if sys.stdin.isatty() and not args.no_pause:
+    if sys.stdin.isatty() and not args.no_pause and not stop_event.is_set():
         press_any_key_to_exit()
+
 
 if __name__ == "__main__":
     main()
-

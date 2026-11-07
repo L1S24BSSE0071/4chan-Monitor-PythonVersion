@@ -54,13 +54,15 @@ Downloads are saved wherever gallery-dl is configured to put them. By default th
 
 ## Command-line options
 
-| Option        | Description                                                                        |
-| ------------- | ---------------------------------------------------------------------------------- |
-| `--loops N`   | Run `N` cycles, then exit. `0` means infinite. If omitted, you're asked at startup |
-| `--dry-run`   | Print the `gallery-dl` command for each thread without downloading anything        |
-| `--no-clear`  | Don't clear the terminal between cycles (useful for logs and CI)                   |
-| `--self-test` | Run the built-in sanity checks and exit                                            |
-| `--help`      | Show usage information                                                             |
+| Option              | Description                                                                        |
+| ------------------- | ---------------------------------------------------------------------------------- |
+| `--loops N`         | Run `N` cycles, then exit. `0` means infinite. If omitted, you're asked at startup |
+| `--dry-run`         | Print the `gallery-dl` command for each thread without downloading anything        |
+| `--no-clear`        | Don't clear the terminal between cycles (useful for logs and CI)                   |
+| `--no-pause`        | Don't wait for a key press before exiting                                          |
+| `--no-update-check` | Skip the PyPI update check at startup                                              |
+| `--self-test`       | Run the built-in sanity checks and exit                                            |
+| `--help`            | Show usage information                                                             |
 
 Examples:
 
@@ -71,9 +73,9 @@ python 4chan-Monitor.py --dry-run --loops 1 --no-clear
 python 4chan-Monitor.py --self-test
 ```
 
-> **Tip:** for unattended runs (services, scheduled tasks), pass `--loops` so the script doesn't wait for input at startup.
+> **Tip:** for unattended runs (services, scheduled tasks), pass `--loops` and `--no-pause` so the script doesn't wait for input at startup or exit.
 >
-> **Note:** `--dry-run` doesn't download anything, but it still sanitizes `threads_4chan.txt` and merges `new_4chan.txt`.
+> **Note:** `--dry-run` doesn't download anything or modify `stats_4chan.txt`, but it still sanitizes `threads_4chan.txt` and merges `new_4chan.txt`.
 
 ## Files
 
@@ -82,7 +84,7 @@ All files live in the directory you run the script from.
 | File                 | Purpose                                                                                  |
 | -------------------- | ---------------------------------------------------------------------------------------- |
 | `threads_4chan.txt`  | Main queue, one URL per line. Cleaned on startup and updated as dead threads are removed |
-| `priority_4chan.txt` | High-priority threads, processed first each cycle. Not modified by the script            |
+| `priority_4chan.txt` | High-priority threads, processed first each cycle. Dead threads are removed automatically |
 | `new_4chan.txt`      | Drop new URLs here. They are merged into the main list and the file is deleted           |
 | `pause_4chan.txt`    | Create this file to pause; delete it to resume                                           |
 | `log_4chan.txt`      | Raw output of the most recent `gallery-dl` run (overwritten for each thread)             |
@@ -95,9 +97,9 @@ Each cycle the monitor:
 
 1. Waits if `pause_4chan.txt` exists
 2. Merges any URLs from `new_4chan.txt` into the main list
-3. Reads the main list and picks pacing based on queue size
+3. Reads the main and priority lists and picks pacing based on queue size
 4. Processes `priority_4chan.txt` first, then the main list, running `gallery-dl --sleep-request 2.0 <url>` for each thread
-5. Removes dead threads from the main list, saves stats, prints a cycle summary
+5. Removes dead threads from the queue files, saves stats, prints a cycle summary
 6. Rests before starting the next cycle
 
 ### Result handling
@@ -105,14 +107,14 @@ Each cycle the monitor:
 | What happened                                                              | Action                                                                      |
 | -------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
 | Exit code 0                                                                | Counted as success                                                          |
-| Exit code 0, but output says the thread was not found, expired or archived | Removed from list                                                           |
-| Output contains `unsupported url`                                          | Removed from list                                                           |
-| Output contains `404 client`                                               | Removed from list                                                           |
-| Output contains `429 too many`, `403 client`, `cloudflare` or `rate limit` | Logged as blocked, pauses 5 minutes, thread stays in the queue              |
+| Deleted individual image (`404`/`410` warning) in an otherwise live thread | Counted as success (partial download)                                       |
+| Output contains `Unsupported URL`                                          | Removed from list                                                           |
+| Output contains thread `404`/`410` `HttpError` or `NotFoundError`          | Removed from list                                                           |
+| Output contains `429`/`403` `HttpError` or `ChallengeError`                | Logged as blocked, pauses 5 minutes, thread stays in the queue              |
 | Any other failure                                                          | Retried up to 3 times (10 s apart), then logged and kept for the next cycle |
 | `gallery-dl` runs longer than 10 minutes                                   | Killed and treated as a failure                                             |
 
-Removals from the main list are logged in `failures_4chan.txt`. Dead threads found in `priority_4chan.txt` are logged too, but that file is never edited by the script, so tidy it up manually.
+Removals are logged in `failures_4chan.txt` and automatically cleaned from `threads_4chan.txt` and `priority_4chan.txt`.
 
 ### Adaptive pacing
 
@@ -134,10 +136,13 @@ Settings are defined in the frozen `Config` dataclass near the top of the script
 | `min_thread_sleep`  | `3`     | Pause between threads when the queue is 10 or more (s) |
 | `max_thread_sleep`  | `15`    | Pause between threads when the queue is 2 or fewer (s) |
 | `base_cycle_sleep`  | `30`    | Normal pause between cycles (s)                        |
+| `busy_cycle_sleep`  | `15`    | Pause between cycles when the queue is 10 or more (s)  |
+| `idle_cycle_sleep`  | `60`    | Pause between cycles when the queue is 2 or fewer (s)  |
 | `blocked_sleep`     | `300`   | Cool-down after a rate limit or Cloudflare block (s)   |
 | `gallery_timeout`   | `600`   | Maximum runtime for one `gallery-dl` call (s)          |
+| `sleep_request`     | `"2.0"` | Seconds passed to `gallery-dl --sleep-request`         |
 
-File names are configured in the same place. The cycle sleeps used for very small and very large queues (60 s and 15 s) are set in `main()`.
+File names are configured in the same place.
 
 ## Controls
 
@@ -154,6 +159,7 @@ File names are configured in the same place. The cycle sleeps used for very smal
 
 ```text
 TOTAL_SESSIONS=0
+TOTAL_CYCLES=0
 TOTAL_SUCCESS=0
 TOTAL_404=0
 TOTAL_BLOCKED=0

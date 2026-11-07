@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 from dataclasses import dataclass, replace
+import locale
 import os
 import re
 import shutil
@@ -135,11 +136,17 @@ stop_event = threading.Event()
 current_proc: Optional[subprocess.Popen] = None
 stop_file: Optional[Path] = None
 progress_callback: Optional[Callable[[str, bool], None]] = None
+download_output_callback: Optional[Callable[[str, str], None]] = None
 
 
 def report_progress(message: str, active: bool) -> None:
     if progress_callback is not None:
         progress_callback(message, active)
+
+
+def report_download_output(line: str, stream: str) -> None:
+    if download_output_callback is not None:
+        download_output_callback(line, stream)
 
 
 def stop_requested() -> bool:
@@ -492,13 +499,51 @@ def run_gallery_dl(url: str) -> RunResult:
         with CFG.log_file.open("wb") as out_f, err_path.open("wb") as err_f:
             proc = subprocess.Popen(
                 cmd,
-                stdout=out_f,
-                stderr=err_f,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
+                bufsize=0,
                 cwd=str(CFG.list_file.parent),
                 **popen_kw,
             )
             current_proc = proc
+            reader_errors = []
+            reader_failed = threading.Event()
+            output_encoding = locale.getpreferredencoding(False)
+
+            def forward_output(pipe, output_file, stream_name: str) -> None:
+                try:
+                    while True:
+                        chunk = pipe.readline()
+                        if not chunk:
+                            break
+                        output_file.write(chunk)
+                        output_file.flush()
+                        if stream_name == "stdout":
+                            report_download_output(
+                                chunk.decode(output_encoding, "replace").rstrip("\r\n"),
+                                stream_name,
+                            )
+                except Exception as e:
+                    reader_errors.append(e)
+                    reader_failed.set()
+                finally:
+                    pipe.close()
+
+            readers = [
+                threading.Thread(
+                    target=forward_output,
+                    args=(proc.stdout, out_f, "stdout"),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=forward_output,
+                    args=(proc.stderr, err_f, "stderr"),
+                    daemon=True,
+                ),
+            ]
+            for reader in readers:
+                reader.start()
             spin = 0
             while True:
                 try:
@@ -506,6 +551,9 @@ def run_gallery_dl(url: str) -> RunResult:
                     break
                 except subprocess.TimeoutExpired:
                     pass
+                if reader_failed.is_set():
+                    kill_tree(proc)
+                    break
                 if stop_requested():
                     _clear_spinner()
                     cprint("  [INTERRUPTED] Stopping gallery-dl", "yellow")
@@ -531,6 +579,15 @@ def run_gallery_dl(url: str) -> RunResult:
                     spin += 1
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5)
+            for reader in readers:
+                reader.join(timeout=5)
+            if any(reader.is_alive() for reader in readers):
+                cprint("  [ERROR] Could not finish reading gallery-dl output", "red")
+                kill_tree(proc)
+                for reader in readers:
+                    reader.join(timeout=1)
+            if reader_errors:
+                raise OSError(f"Could not capture gallery-dl output: {reader_errors[0]}")
             _clear_spinner()
             code = proc.returncode if proc.returncode is not None else 1
     except FileNotFoundError:

@@ -42,7 +42,7 @@ On Windows, double-click `Start-GUI.vbs`. It launches the GUI through `pythonw.e
 pyw -3 .\4chan-Monitor-GUI.pyw
 ```
 
-Add thread URLs to the normal or priority queue in the window, choose how many cycles to run (`0` means indefinitely), then select **Start monitoring**. While monitoring, new normal URLs are queued for the next cycle. During each download, the status area shows the active thread and elapsed time alongside an animated progress bar; this also applies to archive fallback downloads. The GUI runs the monitor engine in-process, so it does not open a command terminal or launch a second copy of the monitor. If startup fails, the GUI shows an error and writes details to `4chan-Monitor-GUI.error.log`.
+Add thread URLs to the normal or priority queue in the window, choose how many cycles to run (`0` means indefinitely), then select **Start monitoring**. While monitoring, new normal URLs are queued for the next cycle. The download panel lists file paths reported by gallery-dl and their actual on-disk sizes; files appear as gallery-dl reports them, including downloads recovered through archive mirrors. The status area continues to show the active thread and elapsed time, without an estimated or simulated percentage. The GUI runs the monitor engine in-process, so it does not open a command terminal or launch a second copy of the monitor. If startup fails, the GUI shows an error and writes details to `4chan-Monitor-GUI.error.log`.
 
 To run the command-line version instead:
 

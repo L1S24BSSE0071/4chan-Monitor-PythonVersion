@@ -81,7 +81,7 @@ class MonitorGUI:
         self.monitor.USE_COLOR = False
         self.worker: Optional[threading.Thread] = None
         self.active_directory: Optional[Path] = None
-        self.download_progress_running = False
+        self.downloaded_files = 0
         self.stop_requested = False
         self.closing = False
         self.monitor_error: Optional[str] = None
@@ -95,6 +95,7 @@ class MonitorGUI:
         self.use_archive = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="Stopped")
         self.stats_summary = tk.StringVar(value="")
+        self.downloaded_files_label = tk.StringVar(value="No files yet")
         self.url = tk.StringVar()
         self.cycles = tk.StringVar(value="0")
 
@@ -383,9 +384,47 @@ class MonitorGUI:
             row=6, column=0, columnspan=3, sticky="nsew", pady=(0, 10)
         )
         output_card.columnconfigure(0, weight=1)
-        output_card.rowconfigure(1, weight=1)
+        output_card.rowconfigure(3, weight=1)
+        downloads_header = ttk.Frame(output_card, style="Card.TFrame")
+        downloads_header.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        ttk.Label(
+            downloads_header, text="Downloaded files", style="Section.TLabel"
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            downloads_header,
+            text="Actual size on disk",
+            style="Muted.Card.TLabel",
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Label(
+            downloads_header,
+            textvariable=self.downloaded_files_label,
+            style="Muted.Card.TLabel",
+        ).pack(side=tk.RIGHT)
+        files_frame = ttk.Frame(output_card, style="Card.TFrame")
+        files_frame.grid(row=1, column=0, sticky="ew", pady=(0, 9))
+        files_frame.columnconfigure(0, weight=1)
+        self.downloaded_files_view = ttk.Treeview(
+            files_frame,
+            columns=("path", "size"),
+            show="headings",
+            height=4,
+            selectmode="browse",
+        )
+        self.downloaded_files_view.heading("path", text="File")
+        self.downloaded_files_view.heading("size", text="Size")
+        self.downloaded_files_view.column("path", width=700, minwidth=180, stretch=True)
+        self.downloaded_files_view.column(
+            "size", width=100, minwidth=80, stretch=False, anchor=tk.E
+        )
+        files_scrollbar = ttk.Scrollbar(
+            files_frame, orient=tk.VERTICAL, command=self.downloaded_files_view.yview
+        )
+        self.downloaded_files_view.configure(yscrollcommand=files_scrollbar.set)
+        self.downloaded_files_view.grid(row=0, column=0, sticky="ew")
+        files_scrollbar.grid(row=0, column=1, sticky="ns")
+
         output_header = ttk.Frame(output_card, style="Card.TFrame")
-        output_header.grid(row=0, column=0, sticky="ew", pady=(0, 7))
+        output_header.grid(row=2, column=0, sticky="ew", pady=(0, 5))
         ttk.Label(
             output_header, text="Activity log", style="Section.TLabel"
         ).pack(side=tk.LEFT)
@@ -408,7 +447,7 @@ class MonitorGUI:
             selectbackground=self.colors["accent"],
             font=("Consolas", 9),
         )
-        self.output.grid(row=1, column=0, sticky="nsew")
+        self.output.grid(row=3, column=0, sticky="nsew")
 
         controls = ttk.Frame(container)
         controls.grid(row=7, column=0, columnspan=3, sticky="ew")
@@ -431,14 +470,10 @@ class MonitorGUI:
             controls, text="Refresh queues", command=self.refresh_queues
         )
         self.refresh_button.pack(side=tk.LEFT, padx=(8, 0))
-        self.download_progress = ttk.Progressbar(
-            controls, mode="indeterminate", length=110, maximum=100
-        )
-        self.download_progress.pack(side=tk.RIGHT, padx=(10, 0))
         self.status_label = ttk.Label(
-            controls, textvariable=self.status, width=38, anchor=tk.E
+            controls, textvariable=self.status, width=44, anchor=tk.E
         )
-        self.status_label.pack(side=tk.RIGHT, padx=(8, 0))
+        self.status_label.pack(side=tk.RIGHT, padx=(8, 0), fill=tk.X, expand=True)
 
     @staticmethod
     def _make_queue_list(parent: ttk.Frame, column: int) -> tk.Listbox:
@@ -478,6 +513,58 @@ class MonitorGUI:
         self.output.configure(state=tk.NORMAL)
         self.output.delete("1.0", tk.END)
         self.output.configure(state=tk.DISABLED)
+
+    def _clear_downloaded_files(self) -> None:
+        self.downloaded_files_view.delete(
+            *self.downloaded_files_view.get_children()
+        )
+        self.downloaded_files = 0
+        self.downloaded_files_label.set("No files yet")
+
+    @staticmethod
+    def _format_file_size(size: int) -> str:
+        value = float(size)
+        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+            if value < 1024 or unit == "TiB":
+                return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+            value /= 1024
+        return f"{value:.1f} TiB"
+
+    def _record_downloaded_file(self, line: str) -> None:
+        candidate = Path(line.strip().strip('"'))
+        if not candidate.is_absolute():
+            candidate = (self.active_directory or Path.cwd()) / candidate
+        try:
+            path = candidate.resolve(strict=True)
+            if not path.is_file():
+                return
+            size = path.stat().st_size
+        except OSError:
+            return
+
+        display_path = str(path)
+        for item in self.downloaded_files_view.get_children():
+            values = self.downloaded_files_view.item(item, "values")
+            if values and values[0] == display_path:
+                self.downloaded_files_view.item(
+                    item, values=(display_path, self._format_file_size(size))
+                )
+                self.downloaded_files_view.move(item, "", 0)
+                self.downloaded_files_view.see(item)
+                return
+
+        item = self.downloaded_files_view.insert(
+            "", 0, values=(display_path, self._format_file_size(size))
+        )
+        self.downloaded_files += 1
+        self.downloaded_files_label.set(
+            f"{self.downloaded_files} file"
+            f"{'s' if self.downloaded_files != 1 else ''} this run"
+        )
+        children = self.downloaded_files_view.get_children()
+        if len(children) > 200:
+            self.downloaded_files_view.delete(children[-1])
+        self.downloaded_files_view.see(item)
 
     def _browse(self) -> None:
         selected = filedialog.askdirectory(
@@ -722,6 +809,8 @@ class MonitorGUI:
         self.active_directory = directory
         self.monitor.stop_event.clear()
         self.monitor.progress_callback = self._queue_progress
+        self.monitor.download_output_callback = self._queue_download_output
+        self._clear_downloaded_files()
         self._set_running(True)
         self.pause_button.configure(
             text="Resume" if (directory / "pause_4chan.txt").exists() else "Pause"
@@ -749,6 +838,9 @@ class MonitorGUI:
 
     def _queue_progress(self, message: str, active: bool) -> None:
         self.events.put(("progress", (message, active)))
+
+    def _queue_download_output(self, line: str, stream: str) -> None:
+        self.events.put(("download_output", (line, stream)))
 
     def toggle_pause(self) -> None:
         if not self.running or self.stop_requested or self.active_directory is None:
@@ -813,15 +905,12 @@ class MonitorGUI:
                 elif value.startswith("[CYCLE]") or value.startswith(" CYCLE:"):
                     self.status.set("Starting cycle...")
             elif kind == "progress":
-                message, active = value
+                message, _active = value
                 self.status.set(self._progress_status(message))
-                if active:
-                    if not self.download_progress_running:
-                        self.download_progress.start(12)
-                        self.download_progress_running = True
-                elif self.download_progress_running:
-                    self.download_progress.stop()
-                    self.download_progress_running = False
+            elif kind == "download_output":
+                line, stream = value
+                if stream == "stdout":
+                    self._record_downloaded_file(line)
             elif kind == "error":
                 self.monitor_error = value
                 self.status.set("Monitor error — see activity log")
@@ -857,9 +946,7 @@ class MonitorGUI:
         self.active_directory = None
         self.monitor.stop_event.clear()
         self.monitor.progress_callback = None
-        if self.download_progress_running:
-            self.download_progress.stop()
-            self.download_progress_running = False
+        self.monitor.download_output_callback = None
         self._set_running(False)
         self.refresh_queues()
         if self.closing:

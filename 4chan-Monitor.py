@@ -513,6 +513,9 @@ def process_thread(
             cprint(f"  [RETRY {attempt}/{CFG.max_retries}] {CFG.retry_sleep}s...", "yellow")
             if interruptible_sleep(CFG.retry_sleep):
                 return False
+            wait_if_paused()
+            if stop_event.is_set():
+                return False
         res = run_gallery_dl(url)
         if res.interrupted or stop_event.is_set():
             return False
@@ -528,10 +531,13 @@ def process_thread(
                 cprint("  [OK] Downloaded (some images no longer exist on the server)", "green")
             else:
                 cprint("  [OK] Downloaded successfully", "green")
-            cprint(f"  [PAUSE] {thread_sleep}s...", "white")
-            print()
             counters["CYCLE_SUCCESS"] += 1
-            return not interruptible_sleep(thread_sleep)
+            if thread_sleep > 0:
+                cprint(f"  [PAUSE] {thread_sleep}s...", "white")
+                print()
+                return not interruptible_sleep(thread_sleep)
+            print()
+            return True
         if kind == "unsupported":
             log_failure(f"UNSUPPORTED: {url}")
             dead_list.append(url)
@@ -752,8 +758,9 @@ def main() -> None:
                 "CYCLE_UNSUPPORTED": 0,
             }
             dead_accum: List[str] = []
-            for label, url in jobs:
-                if not process_thread(url, label, args.dry_run, counters, dead_accum, thread_sleep):
+            for idx, (label, url) in enumerate(jobs):
+                pause_s = thread_sleep if idx < queue_size - 1 else 0
+                if not process_thread(url, label, args.dry_run, counters, dead_accum, pause_s):
                     break
             if dead_accum:
                 remove_dead(dead_accum)
